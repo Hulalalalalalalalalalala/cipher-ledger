@@ -4,8 +4,8 @@ import sqlite3
 from pathlib import Path
 
 
-def connect(database: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(database), timeout=15)
+def connect(database: str | Path, check_same_thread: bool = True) -> sqlite3.Connection:
+    connection = sqlite3.connect(str(database), timeout=15, check_same_thread=check_same_thread)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=15000")
