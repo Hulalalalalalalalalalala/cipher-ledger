@@ -10,11 +10,21 @@ from .ledger import Ledger, LedgerError
 
 IDENT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 MAX_PLAINTEXT_BYTES = 65536
+MAX_BATCH_SIZE = 100
 TENANT_HEADER = "X-Tenant-ID"
 
 
 def is_ident(value: object) -> bool:
     return isinstance(value, str) and IDENT_PATTERN.fullmatch(value) is not None
+
+
+def valid_plaintext(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= MAX_PLAINTEXT_BYTES
+    except UnicodeEncodeError:
+        return False
 
 
 class LedgerServer(ThreadingHTTPServer):
@@ -88,6 +98,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/records":
                 self.create_record()
+            elif path == "/v1/records/batch":
+                self.create_records_batch()
             elif path == "/v1/keys/rotate":
                 self.rotate_keys()
             else:
@@ -115,18 +127,35 @@ class LedgerHandler(BaseHTTPRequestHandler):
             return
         record_id = payload.get("id")
         plaintext = payload.get("plaintext")
-        if not is_ident(record_id) or not isinstance(plaintext, str):
-            self.error(400, "invalid_request")
-            return
-        try:
-            if len(plaintext.encode("utf-8")) > MAX_PLAINTEXT_BYTES:
-                self.error(400, "invalid_request")
-                return
-        except UnicodeEncodeError:
+        if not is_ident(record_id) or not valid_plaintext(plaintext):
             self.error(400, "invalid_request")
             return
         version = self.server.ledger.create(tenant, record_id, plaintext)
         self.send_json(201, {"id": record_id, "key_version": version})
+
+    def create_records_batch(self) -> None:
+        tenant = self.tenant()
+        payload = self.read_json_object()
+        if tenant is None or payload is None:
+            self.error(400, "invalid_request")
+            return
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list) or not 1 <= len(raw_records) <= MAX_BATCH_SIZE:
+            self.error(400, "invalid_request")
+            return
+        entries: list[tuple[str, str]] = []
+        for item in raw_records:
+            if not isinstance(item, dict):
+                self.error(400, "invalid_request")
+                return
+            record_id = item.get("id")
+            plaintext = item.get("plaintext")
+            if not is_ident(record_id) or not valid_plaintext(plaintext):
+                self.error(400, "invalid_request")
+                return
+            entries.append((record_id, plaintext))
+        version, created = self.server.ledger.create_batch(tenant, entries)
+        self.send_json(201, {"key_version": version, "created": created})
 
     def rotate_keys(self) -> None:
         payload = self.read_json_object()

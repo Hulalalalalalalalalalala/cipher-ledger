@@ -75,19 +75,14 @@ class Ledger:
             sealed = envelope.seal(self._keys, version, tenant, record_id, plaintext)
             try:
                 with self._connection:
-                    self._connection.execute(
-                        "INSERT INTO records "
-                        "(tenant, id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            tenant,
-                            record_id,
-                            sealed["key_version"],
-                            sealed["nonce"],
-                            sealed["ciphertext"],
-                            sealed["wrap_nonce"],
-                            sealed["wrapped_key"],
-                        ),
+                    self._insert(
+                        tenant,
+                        record_id,
+                        sealed["key_version"],
+                        sealed["nonce"],
+                        sealed["ciphertext"],
+                        sealed["wrap_nonce"],
+                        sealed["wrapped_key"],
                     )
             except sqlite3.IntegrityError:
                 # PRIMARY KEY (tenant, id) violation -> record already exists.
@@ -95,6 +90,77 @@ class Ledger:
             except sqlite3.Error:
                 raise storage() from None
             return version
+
+    def create_batch(self, tenant: str, entries: list[tuple[str, str]]) -> tuple[int, list[str]]:
+        """Create several records for one tenant atomically.
+
+        Every record is sealed with an independent data key and nonce under the
+        current active key version, then all rows are written in a single
+        transaction. Duplicate ids within the batch or against existing records
+        abort the whole batch with 409 before anything is written; a storage
+        failure rolls the transaction back so no partial batch is observable.
+        Returns (key_version, created_ids_in_input_order).
+        """
+        with self._lock:
+            version = self._active_version
+            record_ids = [record_id for record_id, _ in entries]
+            # Pre-check conflicts before sealing or opening a write transaction.
+            # Duplicates inside the batch and rows already present for this
+            # tenant both surface as 409; nothing is written in either case.
+            if len(set(record_ids)) != len(record_ids):
+                raise conflict()
+            try:
+                rows = self._connection.execute(
+                    "SELECT id FROM records WHERE tenant=? AND id IN (%s)"
+                    % ",".join("?" * len(record_ids)),
+                    (tenant, *record_ids),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            if rows:
+                raise conflict()
+
+            sealed_entries = [
+                envelope.seal(self._keys, version, tenant, record_id, plaintext)
+                for record_id, plaintext in entries
+            ]
+            try:
+                with self._connection:
+                    for record_id, sealed in zip(record_ids, sealed_entries):
+                        self._insert(
+                            tenant,
+                            record_id,
+                            sealed["key_version"],
+                            sealed["nonce"],
+                            sealed["ciphertext"],
+                            sealed["wrap_nonce"],
+                            sealed["wrapped_key"],
+                        )
+            except sqlite3.IntegrityError:
+                # The conflict pre-check above ran under the same lock, so an
+                # IntegrityError here can only be a storage-level failure (e.g.
+                # an abort trigger); the transaction context has rolled back.
+                raise storage() from None
+            except sqlite3.Error:
+                raise storage() from None
+            return version, record_ids
+
+    def _insert(
+        self,
+        tenant: str,
+        record_id: str,
+        version: int,
+        nonce: bytes,
+        ciphertext: bytes,
+        wrap_nonce: bytes,
+        wrapped_key: bytes,
+    ) -> None:
+        self._connection.execute(
+            "INSERT INTO records "
+            "(tenant, id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tenant, record_id, version, nonce, ciphertext, wrap_nonce, wrapped_key),
+        )
 
     def read(self, tenant: str, record_id: str) -> dict:
         with self._lock:
