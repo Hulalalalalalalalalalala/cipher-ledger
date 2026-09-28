@@ -96,6 +96,67 @@ class Ledger:
                 raise storage() from None
             return version
 
+    def create_batch(self, tenant: str, items: list[tuple[str, str]]) -> int:
+        """Create many records in one transaction.
+
+        ``items`` is an ordered list of ``(id, plaintext)`` pairs already
+        validated by the HTTP layer. Every record is sealed independently with
+        its own data key and nonces under the single active version. A duplicate
+        id (within the batch or against stored rows) or any storage failure
+        aborts the whole batch: nothing is inserted.
+        """
+        with self._lock:
+            version = self._active_version
+            record_ids = [record_id for record_id, _plaintext in items]
+
+            try:
+                existing = {
+                    row[0]
+                    for row in self._connection.execute(
+                        "SELECT id FROM records WHERE tenant=?",
+                        (tenant,),
+                    ).fetchall()
+                }
+            except sqlite3.Error:
+                raise storage() from None
+
+            seen: set[str] = set()
+            for record_id in record_ids:
+                if record_id in seen or record_id in existing:
+                    raise conflict()
+                seen.add(record_id)
+
+            sealed_rows = []
+            for record_id, plaintext in items:
+                sealed = envelope.seal(self._keys, version, tenant, record_id, plaintext)
+                sealed_rows.append(
+                    (
+                        tenant,
+                        record_id,
+                        version,
+                        sealed["nonce"],
+                        sealed["ciphertext"],
+                        sealed["wrap_nonce"],
+                        sealed["wrapped_key"],
+                    )
+                )
+
+            try:
+                with self._connection:
+                    self._connection.executemany(
+                        "INSERT INTO records "
+                        "(tenant, id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        sealed_rows,
+                    )
+            except sqlite3.IntegrityError:
+                # PRIMARY KEY (tenant, id) violation from a concurrent writer
+                # that committed between the pre-check and this transaction.
+                raise conflict() from None
+            except sqlite3.Error:
+                raise storage() from None
+            return version
+
     def read(self, tenant: str, record_id: str) -> dict:
         with self._lock:
             try:
