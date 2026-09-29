@@ -1,17 +1,25 @@
 """Threaded HTTP server exposing the public record and key protocol."""
 
+import base64
+import hashlib
+import hmac
 import json
+import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from .config import Config
 from .ledger import Ledger, LedgerError
 
 IDENT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+LIMIT_PATTERN = re.compile(r"[0-9]+\Z")
 MAX_PLAINTEXT_BYTES = 65536
 MAX_BATCH_SIZE = 100
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 100
 TENANT_HEADER = "X-Tenant-ID"
+LIST_CURSOR_VERSION = 1
 
 
 def is_ident(value: object) -> bool:
@@ -32,6 +40,7 @@ class LedgerServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], config: Config):
         self.config = config
+        self.cursor_secret = os.urandom(32)
         self.ledger = Ledger(config)
         super().__init__(address, LedgerHandler)
 
@@ -77,12 +86,15 @@ class LedgerHandler(BaseHTTPRequestHandler):
     # -- routing -----------------------------------------------------------
 
     def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+        split = urlsplit(self.path)
+        path = split.path
         try:
             if path == "/health":
                 self.send_json(200, {"status": "ok", "service": "cipher-ledger"})
             elif path == "/v1/keys":
                 self.send_json(200, {"active_version": self.server.ledger.active_version})
+            elif path == "/v1/records":
+                self.list_records(split.query)
             elif path.startswith("/v1/records/"):
                 self.get_record(path[len("/v1/records/") :])
             else:
@@ -112,6 +124,80 @@ class LedgerHandler(BaseHTTPRequestHandler):
             self.error(500, "internal_error")
 
     # -- endpoints ---------------------------------------------------------
+
+    def encode_cursor(self, tenant: str, snapshot: int, last_id: str) -> str:
+        body = json.dumps(
+            [LIST_CURSOR_VERSION, tenant, snapshot, last_id],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        signature = hmac.new(self.server.cursor_secret, body, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(body + signature).rstrip(b"=").decode("ascii")
+
+    def decode_cursor(self, tenant: str, token: str) -> tuple[int, str] | None:
+        """Validate an opaque cursor for ``tenant``.
+
+        Returns (snapshot, last_id) or None for any malformed or forged token.
+        """
+        try:
+            raw = base64.b64decode(
+                token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
+            )
+            body, signature = raw[: -hashlib.sha256().digest_size], raw[-hashlib.sha256().digest_size :]
+            expected = hmac.new(self.server.cursor_secret, body, hashlib.sha256).digest()
+            if not hmac.compare_digest(signature, expected):
+                return None
+            value = json.loads(body.decode("utf-8"))
+            if not isinstance(value, list) or len(value) != 4:
+                return None
+            version, cursor_tenant, snapshot, last_id = value
+            if (
+                version != LIST_CURSOR_VERSION
+                or cursor_tenant != tenant
+                or type(snapshot) is not int
+                or snapshot < 1
+                or not is_ident(last_id)
+            ):
+                return None
+            return snapshot, last_id
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def list_records(self, query: str) -> None:
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(400, "invalid_request")
+            return
+        parameters = parse_qsl(query, keep_blank_values=True, strict_parsing=False)
+        limit_values = [value for name, value in parameters if name == "limit"]
+        cursor_values = [value for name, value in parameters if name == "cursor"]
+        if len(limit_values) > 1 or len(cursor_values) > 1:
+            self.error(400, "invalid_request")
+            return
+        limit = DEFAULT_LIST_LIMIT
+        if limit_values:
+            if LIMIT_PATTERN.fullmatch(limit_values[0]) is None:
+                self.error(400, "invalid_request")
+                return
+            limit = int(limit_values[0])
+            if not 1 <= limit <= MAX_LIST_LIMIT:
+                self.error(400, "invalid_request")
+                return
+        snapshot = None
+        after_id = None
+        if cursor_values:
+            decoded = self.decode_cursor(tenant, cursor_values[0])
+            if decoded is None:
+                self.error(400, "invalid_request")
+                return
+            snapshot, after_id = decoded
+        items, snapshot, has_more = self.server.ledger.list_records(
+            tenant, limit, snapshot, after_id
+        )
+        body = {"items": items}
+        if has_more:
+            body["next_cursor"] = self.encode_cursor(tenant, snapshot, items[-1])
+        self.send_json(200, body)
 
     def get_record(self, record_id: str) -> None:
         tenant = self.tenant()

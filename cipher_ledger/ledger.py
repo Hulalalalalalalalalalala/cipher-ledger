@@ -219,6 +219,50 @@ class Ledger:
                 )
             return items
 
+    def list_records(
+        self,
+        tenant: str,
+        limit: int,
+        snapshot: int | None,
+        after_id: str | None,
+    ) -> tuple[list[str], int, bool]:
+        """Return one snapshot page of record ids for one tenant.
+
+        The first page (``snapshot`` is None) fixes the listing snapshot as the
+        highest rowid currently present for the tenant. Pages only cover rows
+        with rowid up to that high-water mark, so records created while later
+        pages are fetched never appear; key rotation only updates envelope
+        columns and leaves rowids and ids untouched. The page is ordered by id
+        and keyset-paginated on id, so pages never repeat or skip an id. Only
+        the id column is read; damaged envelopes are listed without issue.
+        One extra row is fetched so the caller knows whether a further page
+        exists even when a page is exactly full. Returns
+        (ids, snapshot_high_water_mark, has_following_page).
+        """
+        with self._lock:
+            try:
+                if snapshot is None:
+                    row = self._connection.execute(
+                        "SELECT MAX(rowid) FROM records WHERE tenant=?",
+                        (tenant,),
+                    ).fetchone()
+                    snapshot = row[0] or 0
+                query = (
+                    "SELECT id FROM records "
+                    "WHERE tenant=? AND rowid<=?"
+                )
+                parameters: list[object] = [tenant, snapshot]
+                if after_id is not None:
+                    query += " AND id>?"
+                    parameters.append(after_id)
+                query += " ORDER BY id ASC LIMIT ?"
+                parameters.append(limit + 1)
+                rows = self._connection.execute(query, parameters).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            ids = [row["id"] for row in rows[:limit]]
+            return ids, snapshot, len(rows) > limit
+
     # -- keys --------------------------------------------------------------
 
     def rotate(self, target: int) -> tuple[int, int]:
