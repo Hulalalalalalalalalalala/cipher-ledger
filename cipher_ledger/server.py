@@ -11,6 +11,8 @@ from .ledger import Ledger, LedgerError
 IDENT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 MAX_PLAINTEXT_BYTES = 65536
 MAX_BATCH_SIZE = 100
+DEFAULT_PAGE_LIMIT = 50
+MAX_PAGE_LIMIT = 100
 TENANT_HEADER = "X-Tenant-ID"
 
 
@@ -77,12 +79,15 @@ class LedgerHandler(BaseHTTPRequestHandler):
     # -- routing -----------------------------------------------------------
 
     def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+        split = urlsplit(self.path)
+        path = split.path
         try:
             if path == "/health":
                 self.send_json(200, {"status": "ok", "service": "cipher-ledger"})
             elif path == "/v1/keys":
                 self.send_json(200, {"active_version": self.server.ledger.active_version})
+            elif path == "/v1/records":
+                self.list_records(split.query)
             elif path.startswith("/v1/records/"):
                 self.get_record(path[len("/v1/records/") :])
             else:
@@ -112,6 +117,40 @@ class LedgerHandler(BaseHTTPRequestHandler):
             self.error(500, "internal_error")
 
     # -- endpoints ---------------------------------------------------------
+
+    def list_records(self, raw_query: str) -> None:
+        tenant = self.tenant()
+        limit: int | None = None
+        cursor: str | None = None
+        if tenant is None:
+            self.error(400, "invalid_request")
+            return
+        for segment in raw_query.split("&") if raw_query else ():
+            name, equals, value = segment.partition("=")
+            if not equals:
+                continue
+            if name == "limit":
+                # Pure ASCII digits, 1..100; duplicate or malformed -> 400.
+                if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= MAX_PAGE_LIMIT:
+                    self.error(400, "invalid_request")
+                    return
+                if limit is not None:
+                    self.error(400, "invalid_request")
+                    return
+                limit = int(value)
+            elif name == "cursor":
+                if cursor is not None:
+                    self.error(400, "invalid_request")
+                    return
+                cursor = value
+            # Any other query parameter is ignored.
+        if limit is None:
+            limit = DEFAULT_PAGE_LIMIT
+        items, next_cursor = self.server.ledger.list_records(tenant, limit, cursor)
+        body = {"items": [{"id": record_id} for record_id in items]}
+        if next_cursor is not None:
+            body["next_cursor"] = next_cursor
+        self.send_json(200, body)
 
     def get_record(self, record_id: str) -> None:
         tenant = self.tenant()

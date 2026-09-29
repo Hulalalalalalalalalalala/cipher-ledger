@@ -7,8 +7,15 @@ single transactional write, so a damaged envelope or a storage failure leaves
 the active version and all records exactly as they were before the request.
 """
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import os
 import sqlite3
 import threading
+from dataclasses import dataclass
 
 from . import envelope
 from .config import Config
@@ -40,12 +47,26 @@ def storage() -> LedgerError:
     return LedgerError(503, "storage_error")
 
 
+def invalid_request() -> LedgerError:
+    return LedgerError(400, "invalid_request")
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    """Immutable tenant record-id list captured at one serial point in time."""
+
+    tenant: str
+    record_ids: tuple[str, ...]
+
+
 class Ledger:
     def __init__(self, config: Config):
         initialize(config.database, config.active_version)
         self._keys = dict(config.keys)
         self._connection = connect(config.database)
         self._lock = threading.RLock()
+        self._cursor_secret = os.urandom(32)
+        self._snapshots: dict[str, _Snapshot] = {}
         try:
             row = self._connection.execute(
                 "SELECT value FROM service_metadata WHERE name='active_version'"
@@ -56,6 +77,100 @@ class Ledger:
         if active not in self._keys:
             raise ValueError("Invalid keyring configuration")
         self._active_version = active
+
+    # -- record listing ----------------------------------------------------
+
+    def list_records(
+        self, tenant: str, limit: int, cursor: str | None
+    ) -> tuple[list[str], str | None]:
+        """List a tenant's record ids from a single stable snapshot.
+
+        A request without a cursor captures the tenant's current ids (ordered
+        by id); later pages addressed by the returned opaque cursor keep
+        serving that same tuple, so concurrent creates and key rotations
+        neither duplicate nor drop entries. Only ids are returned, so damaged
+        envelopes are still listed; reading such a record keeps failing the
+        existing way. New records only become visible through a fresh request
+        without a cursor. Returns (ids, next_cursor_or_None).
+        """
+        with self._lock:
+            if cursor is None:
+                offset = 0
+                try:
+                    rows = self._connection.execute(
+                        "SELECT id FROM records WHERE tenant=? ORDER BY id ASC",
+                        (tenant,),
+                    ).fetchall()
+                except sqlite3.Error:
+                    raise storage() from None
+                snapshot = _Snapshot(tenant, tuple(row["id"] for row in rows))
+                token = os.urandom(18)
+                token_hex = token.hex()
+                # Single-page listings never hand out a cursor, so they need
+                # no retained state; multi-page snapshots stay replayable.
+                if len(snapshot.record_ids) > limit:
+                    self._snapshots[token_hex] = snapshot
+            else:
+                token_hex, offset = self._parse_cursor(cursor)
+                snapshot = self._snapshots.get(token_hex)
+                if snapshot is None or snapshot.tenant != tenant:
+                    raise invalid_request()
+                if not 0 <= offset <= len(snapshot.record_ids):
+                    raise invalid_request()
+
+            end = offset + limit
+            page = list(snapshot.record_ids[offset:end])
+            next_cursor = (
+                self._issue_cursor(token_hex, end, tenant)
+                if end < len(snapshot.record_ids)
+                else None
+            )
+            return page, next_cursor
+
+    def _issue_cursor(self, token_hex: str, offset: int, tenant: str) -> str:
+        body = base64.urlsafe_b64encode(
+            json.dumps(
+                {"t": token_hex, "o": offset, "n": tenant},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        # Omit base64 padding ("=") so the opaque cursor carries safely in a
+        # query string without percent-encoding; padding is restored on parse.
+        encoded_body = body.rstrip(b"=")
+        tag = hmac.new(self._cursor_secret, encoded_body, hashlib.sha256).digest()
+        encoded_tag = base64.urlsafe_b64encode(tag).rstrip(b"=")
+        return (encoded_body + b"." + encoded_tag).decode("ascii")
+
+    def _parse_cursor(self, cursor: str) -> tuple[str, int]:
+        try:
+            body, encoded_tag = cursor.encode("ascii").split(b".", 1)
+            tag = base64.urlsafe_b64decode(encoded_tag + b"=" * (-len(encoded_tag) % 4))
+            expected = hmac.new(self._cursor_secret, body, hashlib.sha256).digest()
+            if len(tag) != 32 or not hmac.compare_digest(tag, expected):
+                raise invalid_request()
+            decoded_body = base64.urlsafe_b64decode(body + b"=" * (-len(body) % 4))
+            payload = json.loads(decoded_body)
+            token_hex = payload["t"]
+            offset = payload["o"]
+            cursor_tenant = payload["n"]
+        except (
+            UnicodeEncodeError,
+            ValueError,
+            KeyError,
+            TypeError,
+            binascii.Error,
+        ):
+            raise invalid_request() from None
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(token_hex, str)
+            or not isinstance(cursor_tenant, str)
+            or type(offset) is not int
+            or len(token_hex) != 36
+            or not all(char in "0123456789abcdef" for char in token_hex)
+        ):
+            raise invalid_request()
+        return token_hex, offset
 
     @property
     def active_version(self) -> int:

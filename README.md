@@ -33,6 +33,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `GET /v1/keys` | 无 | `200 {"active_version":1}` |
 | `POST /v1/records` | 租户头；`{"id":"invoice_1","plaintext":"待保存文字"}` | `201 {"id":"invoice_1","key_version":1}` |
 | `POST /v1/records/batch` | 租户头；`{"records":[{"id":"invoice_1","plaintext":"..."}, ...]}` | `201 {"key_version":1,"created":["invoice_1", ...]}` |
+| `GET /v1/records` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"id":"invoice_1"}, ...],"next_cursor":"..."}` |
 | `GET /v1/records/invoice_1` | 租户头 | `200 {"id":"invoice_1","plaintext":"待保存文字","key_version":1}` |
 | `POST /v1/records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}` | `200 {"items":[{"id":"invoice_1","plaintext":"...","key_version":1}, ...]}` |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
@@ -40,6 +41,10 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
 
 批量接口的 `records` 必须是 1 到 100 项的数组；缺失、空数组、超过 100 项、任一项不是对象、缺失或类型错误的 `id`/`plaintext`、`id` 不合标识符规则或 `plaintext` 超字节上限，均为 `400 invalid_request`，未列明字段照旧忽略。批内重复 id 或任一 id 已存在于该租户返回 `409 {"error":"conflict"}`，此时整批不写入任何记录，已有记录保持不变；不同租户同名 id 仍相互独立。`key_version` 是整批共同使用的当前活动版本，`created` 按输入顺序给出本次创建的 id。SQLite 写入失败返回 `503 storage_error`，整批无部分提交。批内每条记录沿用单条记录的信封格式与 AAD 绑定，使用各自独立的随机数据密钥和 nonce。
+
+记录清单 `GET /v1/records` 同样以 `X-Tenant-ID` 选择租户，只返回 id、不返回 `plaintext` 或 `key_version`，因此密钥轮换不改变分页内容，信封损坏的记录也照常列出其 id（真正读取该记录时仍返回 `422 integrity_error`）。`items` 按 id 的稳定顺序（SQLite BINARY 升序）逐项给出 `{"id":"..."}`，64 字符 id 照常列出，不同租户同名 id 彼此独立。`limit` 省略时每页 50 项；显式给出时必须由纯 ASCII 数字组成且在 1 到 100 之间，否则 `400 invalid_request`。`limit` 或 `cursor` 同名参数重复出现为 `400 invalid_request`，其他查询参数忽略。缺少或无效租户、游标格式损坏或属于其他租户，均为 `400 invalid_request`，错误响应不包含任何部分页面。
+
+游标是不透明值，调用方只把它原样带回同一租户的后续请求。第一次不带 `cursor` 的请求在某个完整串行时刻确定一次清单快照：后续沿返回的 `next_cursor` 翻页时，即使期间发生创建或密钥轮换，也只返回这次快照里的记录，不重复、不漏项；快照之后新建的记录必须重新发起一次不带游标的清单请求才能看到。仍有后续页时响应包含 `next_cursor`，最后一页不带该字段；空租户返回 `200 {"items":[]}` 且不带 `next_cursor`。快照查询发生 SQLite 读取失败返回 `503 storage_error`；快照一旦建立，后续页直接从内存快照给出，因此存储失败不影响已经返回的页。
 
 批量读取的 `ids` 必须是 1 到 100 项的字符串数组，每个 id 符合标识符规则且批内不得重复；字段缺失、非数组、空数组、超过 100 项、任一元素不是字符串或不合规则、批内重复 id，均为 `400 invalid_request`，未列明字段照旧忽略。通过校验后先做整批存在性查询：该查询发生数据库读取失败返回 `503 storage_error`；查询成功后任一 id 不存在或属于另一租户即返回 `404 not_found`，整次不返回任何明文、不做部分结果，因此同时包含不存在 id 与损坏信封时仍确定返回 404。所有 id 都存在后才逐项解密，任一信封认证失败返回 `422 integrity_error`，响应不包含其他条目的明文，服务随后仍可处理正常请求。成功时 `items` 严格按请求顺序逐项给出 `id`、`plaintext`、`key_version`，空串、中文、emoji 和换行原样返回，每项沿用单条读取的信封认证与 AAD 绑定。并发下批量读取等价于一个完整串行时刻：与创建并发时要么完整看到创建前状态（404）要么完整看到创建后记录；与轮换并发时 `items` 中所有 `key_version` 要么全部为轮换前版本、要么全部为轮换后版本，不观察半轮换或部分解密状态。
 
