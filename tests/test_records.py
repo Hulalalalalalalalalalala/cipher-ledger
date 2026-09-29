@@ -709,5 +709,314 @@ class BatchRecordProtocolTests(unittest.TestCase):
         self.assertEqual(self.read("old0")[1]["key_version"], 2)
 
 
+class BatchReadProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.directory = Path(self._dir.name)
+        self.harness = ServerHarness(make_config(self.directory))
+        self.addCleanup(self.harness.close)
+
+    def request(self, method, path, body=None, tenant="acme"):
+        headers = {}
+        if tenant is not None:
+            headers["X-Tenant-ID"] = tenant
+        data = None
+        if body is not None:
+            if isinstance(body, (bytes, str)):
+                data = body if isinstance(body, bytes) else body.encode("utf-8")
+            else:
+                data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(self.harness.base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request) as response:
+                payload = response.read()
+                return response.status, json.loads(payload) if payload else {}
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, json.loads(exc.read())
+
+    def create(self, record_id, plaintext, tenant="acme"):
+        return self.request("POST", "/v1/records", {"id": record_id, "plaintext": plaintext}, tenant=tenant)
+
+    def batch_create(self, records, tenant="acme"):
+        return self.request("POST", "/v1/records/batch", {"records": records}, tenant=tenant)
+
+    def read(self, record_id, tenant="acme"):
+        return self.request("GET", f"/v1/records/{record_id}", None, tenant=tenant)
+
+    def batch_read(self, ids, tenant="acme"):
+        return self.request("POST", "/v1/records/batch/read", {"ids": ids}, tenant=tenant)
+
+    # -- success -----------------------------------------------------------
+
+    def test_batch_read_returns_items_in_request_order(self):
+        self.assertEqual(self.create("invoice_2", "two")[0], 201)
+        self.create("invoice_1", "one 内容")
+        self.create("invoice_3", "three\nline")
+        status, body = self.batch_read(["invoice_3", "invoice_1", "invoice_2"])
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"items": [
+            {"id": "invoice_3", "plaintext": "three\nline", "key_version": 1},
+            {"id": "invoice_1", "plaintext": "one 内容", "key_version": 1},
+            {"id": "invoice_2", "plaintext": "two", "key_version": 1},
+        ]})
+
+    def test_batch_read_preserves_empty_chinese_emoji_newline(self):
+        cases = ("", "中文内容", "emoji 😀🎉 mixed", "line1\nline2\r\n\t结束", "😀" * 100)
+        records = [{"id": f"r_{index}", "plaintext": value} for index, value in enumerate(cases)]
+        self.assertEqual(self.batch_create(records)[0], 201)
+        status, body = self.batch_read([record["id"] for record in reversed(records)])
+        self.assertEqual(status, 200)
+        self.assertEqual([item["plaintext"] for item in body["items"]], list(reversed(cases)))
+
+    def test_batch_read_single_item_matches_single_read(self):
+        self.create("only", "payload 密")
+        single = self.read("only")[1]
+        status, body = self.batch_read(["only"])
+        self.assertEqual((status, body), (200, {"items": [single]}))
+
+    def test_batch_read_matches_single_read_for_every_record(self):
+        records = [{"id": f"id_{index:03d}", "plaintext": f"payload {index} 内容"} for index in range(10)]
+        self.assertEqual(self.batch_create(records)[0], 201)
+        status, body = self.batch_read([record["id"] for record in records])
+        self.assertEqual(status, 200)
+        for record, item in zip(records, body["items"]):
+            self.assertEqual(item, self.read(record["id"])[1])
+
+    def test_batch_read_size_boundaries_accept_100_reject_101(self):
+        self.assertEqual(
+            self.batch_create([{"id": f"id_{index}", "plaintext": "p"} for index in range(100)])[0],
+            201,
+        )
+        self.assertEqual(self.batch_read([f"id_{index}" for index in range(100)])[0], 200)
+        self.assertEqual(
+            self.batch_read([f"id_{index}" for index in range(101)]),
+            (400, {"error": "invalid_request"}),
+        )
+
+    def test_batch_read_accepts_64_char_identifier(self):
+        record_id = "Z" * 64
+        self.create(record_id, "boundary")
+        self.assertEqual(
+            self.batch_read([record_id]),
+            (200, {"items": [{"id": record_id, "plaintext": "boundary", "key_version": 1}]}),
+        )
+
+    # -- validation --------------------------------------------------------
+
+    def test_batch_read_invalid_requests(self):
+        cases = [
+            ({"ids": ["ok"]}, None),
+            ({"ids": ["ok"]}, "bad tenant!"),
+            ({}, "acme"),
+            ({"ids": "nope"}, "acme"),
+            ({"ids": []}, "acme"),
+            ({"ids": [""]}, "acme"),
+            ({"ids": [7]}, "acme"),
+            ({"ids": [None]}, "acme"),
+            ({"ids": [{"id": "x"}]}, "acme"),
+            ({"ids": [["x"]]}, "acme"),
+            ({"ids": ["x" * 65]}, "acme"),
+            ({"ids": ["bad.id"]}, "acme"),
+            ({"ids": ["a", "a"]}, "acme"),
+            ({"ids": ["a", "b", "a"]}, "acme"),
+            ("nope", "acme"),
+            ('{"ids":[', "acme"),
+            (["a"], "acme"),
+            (42, "acme"),
+        ]
+        for body, tenant in cases:
+            with self.subTest(body=body, tenant=tenant):
+                self.assertEqual(
+                    self.request("POST", "/v1/records/batch/read", body, tenant),
+                    (400, {"error": "invalid_request"}),
+                )
+
+    def test_batch_read_extra_fields_are_ignored(self):
+        self.create("x", "p")
+        status, body = self.request("POST", "/v1/records/batch/read",
+                                    {"ids": ["x"], "note": "ignored", "n": 1, "records": []})
+        self.assertEqual((status, body), (200, {"items": [
+            {"id": "x", "plaintext": "p", "key_version": 1},
+        ]}))
+
+    # -- not found and tenant isolation ------------------------------------
+
+    def test_batch_read_unknown_id_is_not_found_without_items(self):
+        self.create("present", "p")
+        status, body = self.batch_read(["present", "missing"])
+        self.assertEqual((status, body), (404, {"error": "not_found"}))
+        status, body = self.batch_read(["missing"])
+        self.assertEqual((status, body), (404, {"error": "not_found"}))
+
+    def test_batch_read_cross_tenant_is_not_found(self):
+        self.create("shared", "tenant-alpha", tenant="alpha")
+        self.assertEqual(self.batch_read(["shared"], tenant="beta"), (404, {"error": "not_found"}))
+        status, body = self.batch_read(["shared"], tenant="alpha")
+        self.assertEqual(body["items"][0]["plaintext"], "tenant-alpha")
+
+    def test_batch_read_same_id_across_tenants_is_independent(self):
+        self.create("shared", "tenant-alpha", tenant="alpha")
+        self.create("shared", "tenant-beta", tenant="beta")
+        _, alpha = self.batch_read(["shared"], tenant="alpha")
+        _, beta = self.batch_read(["shared"], tenant="beta")
+        self.assertEqual(alpha["items"][0]["plaintext"], "tenant-alpha")
+        self.assertEqual(beta["items"][0]["plaintext"], "tenant-beta")
+
+    def test_batch_read_not_found_takes_precedence_over_damaged_envelope(self):
+        self.create("good", "fine")
+        self.create("bad", "also fine")
+        raw = connect(self.directory / "ledger.sqlite3")
+        blob = bytearray(raw.execute("SELECT ciphertext FROM records WHERE id='bad'").fetchone()[0])
+        blob[0] ^= 0xFF
+        with raw:
+            raw.execute("UPDATE records SET ciphertext=? WHERE id='bad'", (bytes(blob),))
+        raw.close()
+        # Damaged envelope alone is an integrity failure ...
+        self.assertEqual(self.batch_read(["good", "bad"]), (422, {"error": "integrity_error"}))
+        # ... but once any id is missing, the whole batch is deterministically 404.
+        self.assertEqual(self.batch_read(["bad", "missing"]), (404, {"error": "not_found"}))
+
+    # -- integrity ---------------------------------------------------------
+
+    def test_batch_read_damaged_envelope_is_422_without_other_plaintext(self):
+        self.create("good", "fine")
+        self.create("bad", "also fine")
+        raw = connect(self.directory / "ledger.sqlite3")
+        blob = bytearray(raw.execute("SELECT ciphertext FROM records WHERE id='bad'").fetchone()[0])
+        blob[0] ^= 0xFF
+        with raw:
+            raw.execute("UPDATE records SET ciphertext=? WHERE id='bad'", (bytes(blob),))
+        raw.close()
+        status, body = self.batch_read(["good", "bad"])
+        self.assertEqual((status, body), (422, {"error": "integrity_error"}))
+        self.assertNotIn("items", body)
+
+    def test_batch_read_service_recovers_after_integrity_failure(self):
+        self.create("bad", "x")
+        raw = connect(self.directory / "ledger.sqlite3")
+        original = bytes(raw.execute("SELECT ciphertext FROM records WHERE id='bad'").fetchone()[0])
+        damaged = bytearray(original)
+        damaged[0] ^= 0x01
+        with raw:
+            raw.execute("UPDATE records SET ciphertext=? WHERE id='bad'", (bytes(damaged),))
+        raw.close()
+        self.assertEqual(self.batch_read(["bad"]), (422, {"error": "integrity_error"}))
+        self.assertEqual(self.read("bad"), (422, {"error": "integrity_error"}))
+        raw = connect(self.directory / "ledger.sqlite3")
+        with raw:
+            raw.execute("UPDATE records SET ciphertext=? WHERE id='bad'", (original,))
+        raw.close()
+        self.assertEqual(self.read("bad")[1]["plaintext"], "x")
+        self.assertEqual(self.batch_read(["bad"])[1]["items"][0]["plaintext"], "x")
+        self.assertEqual(self.create("after", "works")[0], 201)
+        self.assertEqual(self.request("GET", "/health")[0], 200)
+
+    # -- storage failure ---------------------------------------------------
+
+    def test_batch_read_storage_failure_is_503_and_recovers(self):
+        self.create("rec", "payload")
+        raw = connect(self.directory / "ledger.sqlite3")
+        with raw:
+            raw.execute("DROP TABLE records")
+        raw.close()
+        self.assertEqual(self.batch_read(["rec"]), (503, {"error": "storage_error"}))
+
+        raw = connect(self.directory / "ledger.sqlite3")
+        with raw:
+            raw.execute(
+                "CREATE TABLE records ("
+                "tenant TEXT NOT NULL, id TEXT NOT NULL, key_version INTEGER NOT NULL, "
+                "nonce BLOB NOT NULL, ciphertext BLOB NOT NULL, wrap_nonce BLOB NOT NULL, "
+                "wrapped_key BLOB NOT NULL, PRIMARY KEY (tenant, id))"
+            )
+            raw.execute(
+                "INSERT INTO records (tenant, id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key) "
+                "SELECT 'acme', 'rec', 1, ?, ?, ?, ?",
+                (b"\x00" * 12, b"\x01" * 30, b"\x02" * 12, b"\x03" * 48),
+            )
+        raw.close()
+        # Table is back; the placeholder envelope fails authentication, not storage.
+        self.assertEqual(self.batch_read(["rec"]), (422, {"error": "integrity_error"}))
+        self.assertEqual(self.create("after", "works")[0], 201)
+        self.assertEqual(self.batch_read(["after"])[1]["items"][0]["plaintext"], "works")
+
+    # -- concurrency -------------------------------------------------------
+
+    def test_batch_read_concurrent_with_create_is_all_or_nothing(self):
+        barrier = threading.Barrier(7)
+        outcomes = []
+        ids = [f"race_{offset}" for offset in range(20)]
+
+        def create_all():
+            barrier.wait()
+            records = [{"id": record_id, "plaintext": f"p{offset}"} for offset, record_id in enumerate(ids)]
+            outcomes.append(("create", self.batch_create(records)[0]))
+
+        def read_batch(index):
+            barrier.wait()
+            status, body = self.batch_read(ids)
+            if status == 200:
+                self.assertEqual(len(body["items"]), 20)
+                outcomes.append(("read", 200))
+            else:
+                outcomes.append(("read", status))
+
+        threads = [threading.Thread(target=create_all)]
+        threads += [threading.Thread(target=read_batch, args=(i,)) for i in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        statuses = [status for kind, status in outcomes if kind == "read"]
+        self.assertTrue(statuses)
+        self.assertTrue(all(status in (200, 404) for status in statuses))
+        self.assertIn(200, statuses)
+        self.assertEqual(self.batch_read(ids)[0], 200)
+
+    def test_batch_read_concurrent_with_rotation_uses_one_version(self):
+        ids = [f"rec_{index}" for index in range(30)]
+        self.assertEqual(
+            self.batch_create([{"id": record_id, "plaintext": f"p{index}"}
+                              for index, record_id in enumerate(ids)])[0],
+            201,
+        )
+        barrier = threading.Barrier(7)
+        mixed = []
+        failures = []
+
+        def rotate():
+            barrier.wait()
+            status, body = self.request("POST", "/v1/keys/rotate", {"version": 2})
+            if status != 200:
+                failures.append((status, body))
+
+        def read_batch():
+            barrier.wait()
+            status, body = self.batch_read(ids)
+            if status != 200:
+                failures.append((status, body))
+                return
+            versions = {item["key_version"] for item in body["items"]}
+            if len(versions) != 1:
+                mixed.append(versions)
+
+        threads = [threading.Thread(target=rotate)]
+        threads += [threading.Thread(target=read_batch) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(failures, [])
+        self.assertEqual(mixed, [])
+        status, body = self.batch_read(ids)
+        self.assertEqual(status, 200)
+        self.assertEqual({item["key_version"] for item in body["items"]}, {2})
+        for item in body["items"]:
+            self.assertEqual(item, self.read(item["id"])[1])
+
+
 if __name__ == "__main__":
     unittest.main()

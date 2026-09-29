@@ -180,6 +180,47 @@ class Ledger:
                 raise integrity() from None
             return {"id": record_id, "plaintext": plaintext, "key_version": row["key_version"]}
 
+    def read_batch(self, tenant: str, record_ids: list[str]) -> list[dict]:
+        """Decrypt several records for one tenant, in request order.
+
+        Existence and tenant ownership of the whole batch are verified under
+        the process-wide lock before any envelope is opened, so the result is
+        always equivalent to a single point in some serial order: every id is
+        either present for the tenant or the request fails with 404 without
+        returning any plaintext. Only once all rows are present are envelopes
+        decrypted one by one; the first authentication failure aborts the
+        whole batch with 422 and no partial plaintext is returned.
+        """
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    "SELECT id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key "
+                    "FROM records WHERE tenant=? AND id IN (%s)"
+                    % ",".join("?" * len(record_ids)),
+                    (tenant, *record_ids),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            by_id = {row["id"]: row for row in rows}
+            # A missing row means the id either does not exist or belongs to
+            # another tenant; both surface as 404. Checking every id before
+            # decrypting also rules out any partial result.
+            missing = [record_id for record_id in record_ids if record_id not in by_id]
+            if missing:
+                raise not_found()
+
+            items: list[dict] = []
+            for record_id in record_ids:
+                row = by_id[record_id]
+                try:
+                    plaintext = envelope.open_envelope(self._keys, tenant, record_id, row)
+                except envelope.EnvelopeIntegrityError:
+                    raise integrity() from None
+                items.append(
+                    {"id": record_id, "plaintext": plaintext, "key_version": row["key_version"]}
+                )
+            return items
+
     # -- keys --------------------------------------------------------------
 
     def rotate(self, target: int) -> tuple[int, int]:
