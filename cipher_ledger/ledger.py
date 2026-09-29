@@ -180,6 +180,45 @@ class Ledger:
                 raise integrity() from None
             return {"id": record_id, "plaintext": plaintext, "key_version": row["key_version"]}
 
+    def read_batch(self, tenant: str, record_ids: list[str]) -> list[dict]:
+        """Read several records of one tenant as one all-or-nothing request.
+
+        Every envelope row is fetched in a single query. If any requested id is
+        missing (or only exists for another tenant) the whole request fails
+        with 404 before any envelope is opened, so a batch that mixes an
+        unknown id with a damaged envelope still returns 404 and no plaintext
+        is ever produced. Only once all ids are known to exist are the
+        envelopes opened one by one; one authentication failure aborts the
+        batch with 422. The method runs under the process-wide lock, so
+        concurrent creates and rotations are observed as complete serial
+        states (never a half-written batch or a half-rotated key version).
+        Returns items in request order.
+        """
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    "SELECT id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key "
+                    "FROM records WHERE tenant=? AND id IN (%s)"
+                    % ",".join("?" * len(record_ids)),
+                    (tenant, *record_ids),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            by_id = {row["id"]: row for row in rows}
+            if any(record_id not in by_id for record_id in record_ids):
+                raise not_found()
+            items: list[dict] = []
+            for record_id in record_ids:
+                row = by_id[record_id]
+                try:
+                    plaintext = envelope.open_envelope(self._keys, tenant, record_id, row)
+                except envelope.EnvelopeIntegrityError:
+                    raise integrity() from None
+                items.append(
+                    {"id": record_id, "plaintext": plaintext, "key_version": row["key_version"]}
+                )
+            return items
+
     # -- keys --------------------------------------------------------------
 
     def rotate(self, target: int) -> tuple[int, int]:

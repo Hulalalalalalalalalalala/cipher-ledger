@@ -100,6 +100,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.create_record()
             elif path == "/v1/records/batch":
                 self.create_records_batch()
+            elif path == "/v1/records/batch/read":
+                self.read_records_batch()
             elif path == "/v1/keys/rotate":
                 self.rotate_keys()
             else:
@@ -156,6 +158,24 @@ class LedgerHandler(BaseHTTPRequestHandler):
             entries.append((record_id, plaintext))
         version, created = self.server.ledger.create_batch(tenant, entries)
         self.send_json(201, {"key_version": version, "created": created})
+
+    def read_records_batch(self) -> None:
+        tenant = self.tenant()
+        payload = self.read_json_object()
+        if tenant is None or payload is None:
+            self.error(400, "invalid_request")
+            return
+        record_ids = payload.get("ids")
+        if (
+            not isinstance(record_ids, list)
+            or not 1 <= len(record_ids) <= MAX_BATCH_SIZE
+            or any(not is_ident(record_id) for record_id in record_ids)
+            or len(set(record_ids)) != len(record_ids)
+        ):
+            self.error(400, "invalid_request")
+            return
+        items = self.server.ledger.read_batch(tenant, record_ids)
+        self.send_json(200, {"items": items})
 
     def rotate_keys(self) -> None:
         payload = self.read_json_object()
