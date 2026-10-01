@@ -11,6 +11,7 @@ from .config import Config
 from .ledger import EncryptedEntry, Ledger, LedgerError
 
 IDENT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+BATCH_ID_PATTERN = re.compile(r"batch_[0-9a-f]{32}\Z")
 MAX_PLAINTEXT_BYTES = 65536
 MAX_BATCH_SIZE = 100
 MAX_ENCRYPTED_BYTES = 1048576
@@ -120,6 +121,9 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.list_records(split.query)
             elif path.startswith("/v1/records/"):
                 self.get_record(path[len("/v1/records/") :])
+            elif path.startswith("/v1/encrypted-records/batches/"):
+                # Any query string is part of the route split but ignored.
+                self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
             else:
                 self.error(404, "not_found")
         except LedgerError as exc:
@@ -418,6 +422,21 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 "results": [{"id": record_id, "status": "created"} for record_id in record_ids],
             },
         )
+
+    def get_encrypted_batch(self, batch_id: str) -> None:
+        # Tenant resolution is an authorization decision, as on the sealed
+        # ingress: a missing/invalid header fails before the batch id is read.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        # A well-formed tenant but malformed batch id is a plain bad request.
+        if BATCH_ID_PATTERN.fullmatch(batch_id) is None:
+            self.error(400, "invalid_request")
+            return
+        # Query parameters are ignored by design; urlsplit already stripped them.
+        result = self.server.ledger.read_encrypted_batch(tenant, batch_id)
+        self.send_json(200, result)
 
     def rotate_keys(self) -> None:
         payload = self.read_json_object()

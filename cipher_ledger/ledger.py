@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -65,6 +66,23 @@ def tenant_forbidden(message: str | None = None) -> LedgerError:
 
 def batch_write_failed() -> LedgerError:
     return LedgerError(500, "BATCH_WRITE_FAILED")
+
+
+# Stored-shape limits mirrored from the sealed-write ingress. A batch read
+# re-validates every row against these before returning it, so a batch made
+# unreadable by offline tampering with types or lengths is reported as an
+# integrity failure instead of echoing malformed storage.
+ENCRYPTED_ALGORITHM_NONCE = 12
+ENCRYPTED_ALGORITHM_TAG = 16
+ENCRYPTED_ALGORITHMS = {
+    "AES-256-GCM": 32 + ENCRYPTED_ALGORITHM_TAG,
+    "AES-128-GCM": 16 + ENCRYPTED_ALGORITHM_TAG,
+}
+MAX_ENCRYPTED_BYTES = 1048576
+MAX_ENCRYPTION_KEY_ID = 128
+MAX_METADATA_BYTES = 16384
+MAX_ENCRYPTED_BATCH_SIZE = 100
+ENCRYPTED_RECORD_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 
 
 @dataclass(frozen=True)
@@ -401,6 +419,169 @@ class Ledger:
                 # failure all roll the transaction back; nothing is observable.
                 raise batch_write_failed() from None
             return batch_id, record_ids
+
+    def read_encrypted_batch(self, tenant: str, batch_id: str) -> dict:
+        """Return one client-sealed batch in submission order.
+
+        Existence and ownership are a single decision: a batch that is missing
+        or belongs to another tenant is 404 without any of its details being
+        inspected. Once the batch is known to belong to the caller, every
+        batch/record/event relationship and every stored shape is re-validated
+        before anything is returned: counts must agree, positions must cover
+        exactly 0..count-1 on both sides, and tenants/record ids/positions must
+        correspond one by one. Any missing, extra, duplicate, misplaced or
+        cross-tenant association -- like a corrupted metadata JSON document or
+        a stored field of the wrong type or length -- is 422.
+
+        Envelopes are never opened and ciphertext authentication is never
+        evaluated: equal-length ciphertext changes are stored and returned
+        verbatim. Read-only; runs under the process-wide lock, so it observes
+        one complete serial state and never the half-written rows of an
+        uncommitted batch.
+        """
+        with self._lock:
+            try:
+                batch = self._connection.execute(
+                    "SELECT batch_id, tenant, record_count, created_at "
+                    "FROM encrypted_batches WHERE batch_id=?",
+                    (batch_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                raise storage() from None
+            # Lookup is by batch id alone; a foreign tenant gets the same
+            # indistinguishable 404 as a missing batch and no detail check.
+            if batch is None or batch["tenant"] != tenant:
+                raise not_found()
+
+            try:
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, batch_id, position, algorithm, encryption_key_id, "
+                    "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records WHERE batch_id=? ORDER BY position ASC",
+                    (batch_id,),
+                ).fetchall()
+                event_rows = self._connection.execute(
+                    "SELECT batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events WHERE batch_id=? ORDER BY seq ASC",
+                    (batch_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            self._validate_encrypted_batch(batch, record_rows, event_rows)
+
+            records: list[dict] = []
+            for row in record_rows:
+                metadata = None
+                if row["metadata"] is not None:
+                    # The JSON document was validated for shape on write; a
+                    # document that no longer parses to an object is corruption.
+                    metadata = json.loads(row["metadata"])
+                records.append(
+                    {
+                        "id": row["id"],
+                        "algorithm": row["algorithm"],
+                        "key_id": row["encryption_key_id"],
+                        "envelope": {
+                            "nonce": base64.b64encode(bytes(row["envelope_nonce"])).decode("ascii"),
+                            "wrapped_key": base64.b64encode(bytes(row["wrapped_key"])).decode("ascii"),
+                        },
+                        "ciphertext": {
+                            "data": base64.b64encode(bytes(row["ciphertext"])).decode("ascii"),
+                            "nonce": base64.b64encode(bytes(row["ciphertext_nonce"])).decode("ascii"),
+                            "tag": base64.b64encode(bytes(row["tag"])).decode("ascii"),
+                        },
+                        "metadata": metadata,
+                    }
+                )
+            return {
+                "batch_id": batch["batch_id"],
+                "count": len(records),
+                "created_at": batch["created_at"],
+                "records": records,
+            }
+
+    def _validate_encrypted_batch(self, batch, record_rows, event_rows) -> None:
+        """Cross-check batch, records and append events; raise 422 on any drift."""
+        count = batch["record_count"]
+        if type(count) is not int or not 1 <= count <= MAX_ENCRYPTED_BATCH_SIZE:
+            raise integrity()
+        if not isinstance(batch["tenant"], str) or not isinstance(batch["batch_id"], str):
+            raise integrity()
+        if not isinstance(batch["created_at"], str):
+            raise integrity()
+        if len(record_rows) != count or len(event_rows) != count:
+            raise integrity()
+
+        expected_positions = set(range(count))
+        records_by_position: dict[int, object] = {}
+        for row in record_rows:
+            position = row["position"]
+            if type(position) is not int or position not in expected_positions:
+                raise integrity()
+            if position in records_by_position:
+                raise integrity()
+            records_by_position[position] = row
+            if row["tenant"] != batch["tenant"] or row["batch_id"] != batch["batch_id"]:
+                raise integrity()
+            self._validate_encrypted_record(row)
+        if set(records_by_position) != expected_positions:
+            raise integrity()
+
+        events_by_position: dict[int, object] = {}
+        for event in event_rows:
+            position = event["position"]
+            if type(position) is not int or position not in expected_positions:
+                raise integrity()
+            if position in events_by_position:
+                raise integrity()
+            events_by_position[position] = event
+            if event["batch_id"] != batch["batch_id"] or event["tenant"] != batch["tenant"]:
+                raise integrity()
+        if set(events_by_position) != expected_positions:
+            raise integrity()
+
+        for position in range(count):
+            row = records_by_position[position]
+            event = events_by_position[position]
+            if event["record_id"] != row["id"]:
+                raise integrity()
+
+    def _validate_encrypted_record(self, row) -> None:
+        """Re-check one stored sealed record against the write-time shape."""
+        if not isinstance(row["id"], str) or ENCRYPTED_RECORD_ID.fullmatch(row["id"]) is None:
+            raise integrity()
+        wrapped_len = ENCRYPTED_ALGORITHMS.get(row["algorithm"]) if isinstance(
+            row["algorithm"], str
+        ) else None
+        if wrapped_len is None:
+            raise integrity()
+        key_id = row["encryption_key_id"]
+        if key_id is not None and (
+            not isinstance(key_id, str) or not 1 <= len(key_id) <= MAX_ENCRYPTION_KEY_ID
+        ):
+            raise integrity()
+        blob_fields = (
+            ("envelope_nonce", ENCRYPTED_ALGORITHM_NONCE, ENCRYPTED_ALGORITHM_NONCE),
+            ("wrapped_key", wrapped_len, wrapped_len),
+            ("ciphertext", 0, MAX_ENCRYPTED_BYTES),
+            ("ciphertext_nonce", ENCRYPTED_ALGORITHM_NONCE, ENCRYPTED_ALGORITHM_NONCE),
+            ("tag", ENCRYPTED_ALGORITHM_TAG, ENCRYPTED_ALGORITHM_TAG),
+        )
+        for name, minimum, maximum in blob_fields:
+            value = row[name]
+            if not isinstance(value, bytes) or not minimum <= len(value) <= maximum:
+                raise integrity()
+        metadata = row["metadata"]
+        if metadata is not None:
+            if not isinstance(metadata, str) or len(metadata.encode("utf-8")) > MAX_METADATA_BYTES:
+                raise integrity()
+            try:
+                parsed = json.loads(metadata)
+            except (ValueError, RecursionError):
+                raise integrity() from None
+            if not isinstance(parsed, dict):
+                raise integrity()
 
     def read(self, tenant: str, record_id: str) -> dict:
         with self._lock:
