@@ -18,6 +18,7 @@ import threading
 from dataclasses import dataclass
 
 from . import envelope
+from . import encrypted_batch
 from .config import Config
 from .database import connect, initialize
 
@@ -25,10 +26,13 @@ from .database import connect, initialize
 class LedgerError(Exception):
     """Application-level error mapped to an HTTP status and code."""
 
-    def __init__(self, status: int, code: str):
+    def __init__(self, status: int, code: str, message: str | None = None):
         super().__init__(code)
         self.status = status
         self.code = code
+        # Optional human-readable detail identifying the offending input.
+        # Existing endpoints leave it None, so their error bodies are unchanged.
+        self.message = message
 
 
 def conflict() -> LedgerError:
@@ -49,6 +53,18 @@ def storage() -> LedgerError:
 
 def invalid_request() -> LedgerError:
     return LedgerError(400, "invalid_request")
+
+
+def invalid_batch(message: str) -> LedgerError:
+    return LedgerError(400, "INVALID_BATCH", message)
+
+
+def tenant_record_forbidden(message: str) -> LedgerError:
+    return LedgerError(403, "TENANT_RECORD_FORBIDDEN", message)
+
+
+def batch_write_failed(message: str) -> LedgerError:
+    return LedgerError(500, "BATCH_WRITE_FAILED", message)
 
 
 @dataclass(frozen=True)
@@ -276,6 +292,186 @@ class Ledger:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (tenant, record_id, version, nonce, ciphertext, wrap_nonce, wrapped_key),
         )
+
+    # -- client-sealed encrypted batches -----------------------------------
+
+    def create_encrypted_batch(
+        self,
+        tenant: str,
+        entries: list["encrypted_batch.EncryptedEntry"],
+        idempotency_key: str | None,
+    ) -> dict:
+        """Validate then atomically commit a batch of client-sealed records.
+
+        The server never opens, decrypts or shares the per-record envelope
+        material: each entry's own envelope/nonce/ciphertext bytes are stored
+        verbatim alongside the server-bound (tenant, id). Every check for the
+        whole batch completes before the single write transaction opens, so
+        the commit is all-or-nothing and all entries appear at one serial point.
+
+        Returns the public 201 body. Raises LedgerError:
+        403 TENANT_RECORD_FORBIDDEN - a record claims another tenant;
+        400 INVALID_BATCH           - id/order/existence/idempotency conflict;
+        500 BATCH_WRITE_FAILED      - any constraint or append failure, rolled
+                                      back with nothing observable.
+        """
+        with self._lock:
+            # 1) A per-record tenant claim that disagrees with the upstream
+            #    identity is a cross-tenant write attempt, not a bad shape.
+            for index, entry in enumerate(entries):
+                if entry.tenant_claim is not None and entry.tenant_claim != tenant:
+                    raise tenant_record_forbidden(
+                        f"records[{index}].tenant: record claims tenant "
+                        f"'{entry.tenant_claim}' but request is authenticated as '{tenant}'"
+                    )
+
+            record_ids = [entry.record_id for entry in entries]
+            fingerprint = self._encrypted_batch_fingerprint(entries)
+
+            # 2) Idempotent replay. A retried key whose content matches the
+            #    original commit returns that commit exactly once more; a key
+            #    reused with different content is an invalid conflicting batch.
+            if idempotency_key is not None:
+                replay = self._find_idempotent_commit(tenant, idempotency_key)
+                if replay is not None:
+                    committed_batch_id, committed_ids, committed_fingerprint = replay
+                    if committed_fingerprint != fingerprint or committed_ids != record_ids:
+                        raise invalid_batch(
+                            "idempotency_key: key was already committed with a "
+                            "different set of records"
+                        )
+                    return self._encrypted_batch_body(
+                        committed_batch_id, tenant, idempotency_key, record_ids
+                    )
+
+            # 3) Whole-batch existence pre-check against this tenant's rows.
+            #    Other tenants' ids are intentionally not matched: same id in
+            #    another tenant is independent. In-batch duplicates were already
+            #    rejected structurally and surface as INVALID_BATCH too.
+            existing = self._existing_encrypted_ids(tenant, record_ids)
+            if existing:
+                conflict_id = next(record_id for record_id in record_ids if record_id in existing)
+                raise invalid_batch(
+                    f"records[{record_ids.index(conflict_id)}].id: record "
+                    f"'{conflict_id}' already exists for tenant '{tenant}'"
+                )
+
+            # 4) One atomic commit: all record rows and the commit ledger row
+            #    appear together or not at all.
+            batch_id = self._new_batch_id()
+            ids_json = json.dumps(record_ids, ensure_ascii=False, separators=(",", ":"))
+            try:
+                with self._connection:
+                    for entry in entries:
+                        self._connection.execute(
+                            "INSERT INTO encrypted_records "
+                            "(tenant, id, algorithm, envelope, nonce, ciphertext, "
+                            "metadata, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                tenant,
+                                entry.record_id,
+                                entry.algorithm_json,
+                                base64.b64encode(entry.envelope).decode("ascii"),
+                                entry.nonce,
+                                entry.ciphertext,
+                                entry.metadata_json,
+                                batch_id,
+                            ),
+                        )
+                    self._connection.execute(
+                        "INSERT INTO batch_commits "
+                        "(batch_id, tenant, idempotency_key, record_count, "
+                        "record_ids, fingerprint) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            batch_id,
+                            tenant,
+                            idempotency_key,
+                            len(entries),
+                            ids_json,
+                            fingerprint,
+                        ),
+                    )
+            except sqlite3.Error:
+                # Constraint violation (including an abort trigger) or any
+                # append/storage failure: the transaction has rolled back, no
+                # record is visible and nothing is committed.
+                raise batch_write_failed(
+                    "batch could not be committed atomically; no records were written"
+                ) from None
+
+            return self._encrypted_batch_body(batch_id, tenant, idempotency_key, record_ids)
+
+    @staticmethod
+    def _encrypted_batch_fingerprint(entries: list["encrypted_batch.EncryptedEntry"]) -> str:
+        """Deterministic SHA-256 over the exact sealed content of a batch."""
+        digest = hashlib.sha256()
+        for entry in entries:
+            canonical = json.dumps(
+                [
+                    entry.record_id,
+                    entry.tenant_claim,
+                    entry.algorithm_json,
+                    base64.b64encode(entry.envelope).decode("ascii"),
+                    base64.b64encode(entry.nonce).decode("ascii"),
+                    base64.b64encode(entry.ciphertext).decode("ascii"),
+                    entry.metadata_json,
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            digest.update(str(len(canonical)).encode("ascii"))
+            digest.update(b":")
+            digest.update(canonical)
+        return digest.hexdigest()
+
+    def _find_idempotent_commit(
+        self, tenant: str, idempotency_key: str
+    ) -> tuple[str, list[str], str] | None:
+        try:
+            row = self._connection.execute(
+                "SELECT batch_id, record_ids, fingerprint FROM batch_commits "
+                "WHERE tenant=? AND idempotency_key=?",
+                (tenant, idempotency_key),
+            ).fetchone()
+        except sqlite3.Error:
+            raise batch_write_failed("could not look up idempotency key") from None
+        if row is None:
+            return None
+        try:
+            committed_ids = json.loads(row["record_ids"])
+        except ValueError:
+            raise batch_write_failed("stored commit metadata is unreadable") from None
+        return row["batch_id"], committed_ids, row["fingerprint"]
+
+    def _existing_encrypted_ids(self, tenant: str, record_ids: list[str]) -> set[str]:
+        try:
+            rows = self._connection.execute(
+                "SELECT id FROM encrypted_records WHERE tenant=? AND id IN (%s)"
+                % ",".join("?" * len(record_ids)),
+                (tenant, *record_ids),
+            ).fetchall()
+        except sqlite3.Error:
+            raise batch_write_failed("could not check existing records") from None
+        return {row["id"] for row in rows}
+
+    @staticmethod
+    def _new_batch_id() -> str:
+        token = base64.urlsafe_b64encode(os.urandom(18)).rstrip(b"=")
+        return "bat_" + token.decode("ascii")
+
+    @staticmethod
+    def _encrypted_batch_body(
+        batch_id: str, tenant: str, idempotency_key: str | None, record_ids: list[str]
+    ) -> dict:
+        body = {
+            "batch_id": batch_id,
+            "tenant": tenant,
+            "count": len(record_ids),
+            "records": [{"id": record_id, "status": "created"} for record_id in record_ids],
+        }
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        return body
 
     def read(self, tenant: str, record_id: str) -> dict:
         with self._lock:

@@ -6,9 +6,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .config import Config
+from . import encrypted_batch
 from .ledger import Ledger, LedgerError
 
 IDENT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+IDEMPOTENCY_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 MAX_PLAINTEXT_BYTES = 65536
 MAX_BATCH_SIZE = 100
 DEFAULT_PAGE_LIMIT = 50
@@ -58,6 +60,15 @@ class LedgerHandler(BaseHTTPRequestHandler):
     def error(self, status: int, code: str) -> None:
         self.send_json(status, {"error": code})
 
+    def error_detail(self, status: int, code: str, message: str) -> None:
+        self.send_json(status, {"error": code, "message": message})
+
+    def ledger_error(self, exc: LedgerError) -> None:
+        if exc.message is None:
+            self.error(exc.status, exc.code)
+        else:
+            self.error_detail(exc.status, exc.code, exc.message)
+
     def tenant(self) -> str | None:
         value = self.headers.get(TENANT_HEADER)
         return value if is_ident(value) else None
@@ -93,7 +104,7 @@ class LedgerHandler(BaseHTTPRequestHandler):
             else:
                 self.error(404, "not_found")
         except LedgerError as exc:
-            self.error(exc.status, exc.code)
+            self.ledger_error(exc)
         except Exception:
             # Never leak stack traces or crypto library details.
             self.error(500, "internal_error")
@@ -107,12 +118,14 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.create_records_batch()
             elif path == "/v1/records/batch/read":
                 self.read_records_batch()
+            elif path == "/v1/encrypted-records/batches":
+                self.create_encrypted_batch()
             elif path == "/v1/keys/rotate":
                 self.rotate_keys()
             else:
                 self.error(404, "not_found")
         except LedgerError as exc:
-            self.error(exc.status, exc.code)
+            self.ledger_error(exc)
         except Exception:
             self.error(500, "internal_error")
 
@@ -197,6 +210,53 @@ class LedgerHandler(BaseHTTPRequestHandler):
             entries.append((record_id, plaintext))
         version, created = self.server.ledger.create_batch(tenant, entries)
         self.send_json(201, {"key_version": version, "created": created})
+
+    def create_encrypted_batch(self) -> None:
+        """POST /v1/encrypted-records/batches: one atomic client-sealed batch.
+
+        Records arrive already encrypted by the caller. The service validates
+        shape, identifiers, algorithm metadata and consistency, then commits
+        every row in one transaction. It never decrypts, unwraps, derives or
+        shares the per-record envelope key material.
+        """
+        tenant = self.tenant()
+        payload = self.read_json_object()
+        # On this endpoint an identity that cannot determine a tenant is a
+        # forbidden request (existing endpoints keep their own 400 behavior).
+        if tenant is None:
+            self.error_detail(
+                403,
+                "TENANT_RECORD_FORBIDDEN",
+                "request identity could not determine a tenant: "
+                "missing or invalid X-Tenant-ID",
+            )
+            return
+        if payload is None:
+            self.error_detail(
+                400, "INVALID_BATCH", "request body must be a UTF-8 JSON object"
+            )
+            return
+
+        idempotency_key = payload.get("idempotency_key")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not IDEMPOTENCY_PATTERN.fullmatch(
+                idempotency_key
+            ):
+                self.error_detail(
+                    400,
+                    "INVALID_BATCH",
+                    "idempotency_key: must match [A-Za-z0-9_-]{1,128} when present",
+                )
+                return
+
+        try:
+            entries = encrypted_batch.validate_records(payload.get("records"))
+        except encrypted_batch.InvalidBatch as exc:
+            self.error_detail(400, "INVALID_BATCH", str(exc))
+            return
+
+        result = self.server.ledger.create_encrypted_batch(tenant, entries, idempotency_key)
+        self.send_json(201, result)
 
     def read_records_batch(self) -> None:
         tenant = self.tenant()
