@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import envelope
+from . import envelope, sealed
 from .config import Config
 from .database import connect, initialize
 
@@ -401,6 +401,151 @@ class Ledger:
                 # failure all roll the transaction back; nothing is observable.
                 raise batch_write_failed() from None
             return batch_id, record_ids
+
+    def read_encrypted_batch(self, tenant: str, batch_id: str) -> dict:
+        """Return one tenant's whole sealed batch after a full integrity check.
+
+        The read confirms the batch row, its records and its append events are
+        one consistent structure, all under the process-wide lock so the three
+        queries observe one complete serial state (a concurrent commit is seen
+        either whole or not at all):
+
+        * the batch must exist for ``tenant`` -- a batch owned by another
+          tenant is reported as 404 and its contents are never inspected;
+        * record_count is within the write-time 1..100 bound;
+        * every record and event carrying this batch id belongs to the batch
+          tenant -- no cross-tenant associations;
+        * record and event counts both equal record_count, record positions
+          (ordered by position) and event positions (ordered by append seq)
+          each cover exactly 0..count-1 with no duplicates or gaps, and the
+          (record_id, position) pairs match one-to-one;
+        * each stored record still satisfies the write shape: identifier,
+          algorithm, byte-field lengths, key_id and metadata JSON.
+
+        Envelopes are never decrypted and ciphertext is never authenticated:
+        shape-valid byte changes come back verbatim. Any inconsistency is a
+        damaged-store 422 integrity_error with no partial records; a failed
+        SQLite read is 503 storage_error. The method only SELECTs.
+        """
+        with self._lock:
+            try:
+                batch = self._connection.execute(
+                    "SELECT tenant, record_count, created_at FROM encrypted_batches "
+                    "WHERE batch_id=?",
+                    (batch_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                raise storage() from None
+            if batch is None or batch["tenant"] != tenant:
+                # Another tenant's batch is indistinguishable from a missing
+                # one; its details are deliberately not examined.
+                raise not_found()
+
+            count = batch["record_count"]
+            created_at = batch["created_at"]
+            if type(count) is not int or not 1 <= count <= sealed.MAX_BATCH_SIZE:
+                raise integrity()
+            if not isinstance(created_at, str):
+                raise integrity()
+
+            try:
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, position, algorithm, encryption_key_id, "
+                    "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records WHERE batch_id=? ORDER BY position",
+                    (batch_id,),
+                ).fetchall()
+                event_rows = self._connection.execute(
+                    "SELECT tenant, record_id, position FROM encrypted_record_events "
+                    "WHERE batch_id=? ORDER BY seq",
+                    (batch_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            if len(record_rows) != count or len(event_rows) != count:
+                raise integrity()
+            if any(row["tenant"] != tenant for row in record_rows):
+                raise integrity()
+            if any(row["tenant"] != tenant for row in event_rows):
+                raise integrity()
+
+            positions = [row["position"] for row in record_rows]
+            if any(type(position) is not int for position in positions):
+                raise integrity()
+            if positions != list(range(count)):
+                raise integrity()
+
+            record_ids = [row["id"] for row in record_rows]
+            if any(not sealed.is_ident(record_id) for record_id in record_ids):
+                raise integrity()
+            if len(set(record_ids)) != count:
+                raise integrity()
+
+            # Events sorted by append sequence must line up, position by
+            # position, with the records; sorted-position equality also proves
+            # event positions are exactly 0..count-1 with no gaps or dupes.
+            events_in_order = sorted(
+                (row["position"], row["record_id"]) for row in event_rows
+            )
+            if any(type(position) is not int for position, _ in events_in_order):
+                raise integrity()
+            if events_in_order != list(enumerate(record_ids)):
+                raise integrity()
+
+            records: list[dict] = []
+            for row in record_rows:
+                profile = sealed.ENCRYPTED_ALGORITHMS.get(row["algorithm"])
+                if profile is None:
+                    raise integrity()
+                if not sealed.valid_key_id(row["encryption_key_id"]):
+                    raise integrity()
+                envelope_nonce = row["envelope_nonce"]
+                wrapped_key = row["wrapped_key"]
+                body = row["ciphertext"]
+                ciphertext_nonce = row["ciphertext_nonce"]
+                tag = row["tag"]
+                if not isinstance(envelope_nonce, bytes) or len(envelope_nonce) != profile["nonce"]:
+                    raise integrity()
+                if not isinstance(wrapped_key, bytes) or len(wrapped_key) != profile["wrapped_key"]:
+                    raise integrity()
+                if not isinstance(body, bytes) or len(body) > sealed.MAX_ENCRYPTED_BYTES:
+                    raise integrity()
+                if (
+                    not isinstance(ciphertext_nonce, bytes)
+                    or len(ciphertext_nonce) != profile["nonce"]
+                ):
+                    raise integrity()
+                if not isinstance(tag, bytes) or len(tag) != profile["tag"]:
+                    raise integrity()
+                metadata_text = row["metadata"]
+                if not sealed.valid_metadata_text(metadata_text):
+                    raise integrity()
+                metadata = json.loads(metadata_text) if metadata_text is not None else None
+                records.append(
+                    {
+                        "id": row["id"],
+                        "algorithm": row["algorithm"],
+                        "key_id": row["encryption_key_id"],
+                        "envelope": {
+                            "nonce": sealed.encode_bytes_field(envelope_nonce),
+                            "wrapped_key": sealed.encode_bytes_field(wrapped_key),
+                        },
+                        "ciphertext": {
+                            "data": sealed.encode_bytes_field(body),
+                            "nonce": sealed.encode_bytes_field(ciphertext_nonce),
+                            "tag": sealed.encode_bytes_field(tag),
+                        },
+                        "metadata": metadata,
+                    }
+                )
+
+            return {
+                "batch_id": batch_id,
+                "count": count,
+                "created_at": created_at,
+                "records": records,
+            }
 
     def read(self, tenant: str, record_id: str) -> dict:
         with self._lock:

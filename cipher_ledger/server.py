@@ -1,56 +1,27 @@
 """Threaded HTTP server exposing the public record and key protocol."""
 
-import base64
-import binascii
 import json
-import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .config import Config
 from .ledger import EncryptedEntry, Ledger, LedgerError
+from .sealed import (
+    ENCRYPTED_ALGORITHMS,
+    MAX_BATCH_SIZE,
+    MAX_ENCRYPTION_KEY_ID,
+    MAX_ENCRYPTED_BYTES,
+    MAX_METADATA_BYTES,
+    decode_bytes_field,
+    is_batch_id,
+    is_ident,
+    valid_key_id,
+    valid_plaintext,
+)
 
-IDENT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
-MAX_PLAINTEXT_BYTES = 65536
-MAX_BATCH_SIZE = 100
-MAX_ENCRYPTED_BYTES = 1048576
-MAX_METADATA_BYTES = 16384
-MAX_ENCRYPTION_KEY_ID = 128
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 100
 TENANT_HEADER = "X-Tenant-ID"
-
-# Algorithms accepted on the encrypted ingress. Each pins the exact byte
-# lengths the service validates and stores, so an unsupported value or a body
-# whose fields do not match its algorithm is rejected before any write.
-ENCRYPTED_ALGORITHMS = {
-    # wrapped_key = data-key length + 16-byte GCM auth tag.
-    "AES-256-GCM": {"nonce": 12, "tag": 16, "wrapped_key": 32 + 16},
-    "AES-128-GCM": {"nonce": 12, "tag": 16, "wrapped_key": 16 + 16},
-}
-
-
-def is_ident(value: object) -> bool:
-    return isinstance(value, str) and IDENT_PATTERN.fullmatch(value) is not None
-
-
-def valid_plaintext(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        return len(value.encode("utf-8")) <= MAX_PLAINTEXT_BYTES
-    except UnicodeEncodeError:
-        return False
-
-
-def decode_bytes_field(value: object) -> bytes | None:
-    """Decode one base64 (standard, padded) field; None covers absent/non-str."""
-    if not isinstance(value, str):
-        return None
-    try:
-        return base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError):
-        return None
 
 
 class LedgerServer(ThreadingHTTPServer):
@@ -120,6 +91,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.list_records(split.query)
             elif path.startswith("/v1/records/"):
                 self.get_record(path[len("/v1/records/") :])
+            elif path.startswith("/v1/encrypted-records/batches/"):
+                self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
             else:
                 self.error(404, "not_found")
         except LedgerError as exc:
@@ -311,10 +284,7 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 return
 
             key_id = item.get("key_id")
-            if key_id is not None and (
-                not isinstance(key_id, str)
-                or not 1 <= len(key_id) <= MAX_ENCRYPTION_KEY_ID
-            ):
+            if not valid_key_id(key_id):
                 self.error(
                     400,
                     "INVALID_BATCH",
@@ -418,6 +388,22 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 "results": [{"id": record_id, "status": "created"} for record_id in record_ids],
             },
         )
+
+    def get_encrypted_batch(self, batch_id: str) -> None:
+        # Tenant resolution is an authorization decision, exactly as on the
+        # sealed write ingress: a missing/unverifiable identity is rejected
+        # before the batch id is even parsed.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        # Query parameters are ignored; the single path segment is the only
+        # thing identifying a batch.
+        if not is_batch_id(batch_id):
+            self.error(400, "invalid_request")
+            return
+        result = self.server.ledger.read_encrypted_batch(tenant, batch_id)
+        self.send_json(200, result)
 
     def rotate_keys(self) -> None:
         payload = self.read_json_object()
