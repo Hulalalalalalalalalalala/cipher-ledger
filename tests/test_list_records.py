@@ -1,3 +1,4 @@
+import base64
 import json
 import tempfile
 import threading
@@ -230,13 +231,27 @@ class ListRecordsProtocolTests(unittest.TestCase):
             self.create(f"r{index}")
         valid_cursor = self.list("limit=2")[1]["next_cursor"]
         body, tag = valid_cursor.split(".", 1)
+
+        def corrupt_tag_token(encoded_tag: str) -> str:
+            # Flip a bit guaranteed to be significant (the first tag byte's
+            # top bit); editing only the trailing base64 char is a no-op when
+            # that char's significant bits happen to be zero.
+            pad = "=" * (-len(encoded_tag) % 4)
+            raw = bytearray(base64.urlsafe_b64decode(encoded_tag + pad))
+            raw[0] ^= 0x80
+            return base64.urlsafe_b64encode(bytes(raw)).rstrip(b"=").decode()
+
+        def corrupt_cursor(cursor: str) -> str:
+            cursor_body, cursor_tag = cursor.split(".", 1)
+            return cursor_body + "." + corrupt_tag_token(cursor_tag)
+
         cases = [
             "",
             "not-a-cursor",
             "a.b.c",
-            body + "." + tag[:-2] + ("AA" if not tag.endswith("AA") else "BB"),
+            body + "." + corrupt_tag_token(tag),
             "YWJj." + tag,
-            valid_cursor[:-1] + ("A" if valid_cursor[-1] != "A" else "B"),
+            corrupt_cursor(valid_cursor),
             valid_cursor + "%20",
             "cursor%20value%20with%20space",
         ]

@@ -44,6 +44,44 @@ def initialize(database: str | Path, initial_version: int | None = None) -> None
                 "wrapped_key BLOB NOT NULL, "
                 "PRIMARY KEY (tenant, id))"
             )
+            # Client-sealed records submitted through the encrypted batch
+            # ingress. The server never wraps or unwraps these envelopes: the
+            # body key arrives already wrapped under a client-chosen algorithm,
+            # so metadata/algorithm are stored verbatim alongside the bytes.
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_batches ("
+                "batch_id TEXT NOT NULL PRIMARY KEY, "
+                "tenant TEXT NOT NULL, "
+                "record_count INTEGER NOT NULL, "
+                "created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_records ("
+                "tenant TEXT NOT NULL, "
+                "id TEXT NOT NULL, "
+                "batch_id TEXT NOT NULL, "
+                "position INTEGER NOT NULL, "
+                "algorithm TEXT NOT NULL, "
+                "encryption_key_id TEXT, "
+                "envelope_nonce BLOB NOT NULL, "
+                "wrapped_key BLOB NOT NULL, "
+                "ciphertext BLOB NOT NULL, "
+                "ciphertext_nonce BLOB NOT NULL, "
+                "tag BLOB, "
+                "metadata TEXT, "
+                "PRIMARY KEY (tenant, id))"
+            )
+            # Append-only ledger: one row per record that ever became visible,
+            # inserted in the same transaction as its record. It makes every
+            # committed batch observable as one indivisible append.
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_record_events ("
+                "seq INTEGER NOT NULL PRIMARY KEY, "
+                "batch_id TEXT NOT NULL, "
+                "tenant TEXT NOT NULL, "
+                "record_id TEXT NOT NULL, "
+                "position INTEGER NOT NULL)"
+            )
             if initial_version is not None:
                 connection.execute(
                     "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",
