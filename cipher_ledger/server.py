@@ -19,6 +19,7 @@ MAX_METADATA_BYTES = 16384
 MAX_ENCRYPTION_KEY_ID = 128
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 100
+MAX_EVENT_SEQ = 9_223_372_036_854_775_807
 TENANT_HEADER = "X-Tenant-ID"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 
@@ -124,6 +125,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.get_record(path[len("/v1/records/") :])
             elif path == "/v1/encrypted-records/batches":
                 self.list_encrypted_batches(split.query)
+            elif path == "/v1/encrypted-records/events":
+                self.list_encrypted_events(split.query)
             elif path.startswith("/v1/encrypted-records/batches/"):
                 # Any query string is part of the route split but ignored.
                 self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
@@ -514,8 +517,78 @@ class LedgerHandler(BaseHTTPRequestHandler):
             body["next_cursor"] = next_cursor
         self.send_json(200, body)
 
-    def get_encrypted_batch(self, batch_id: str) -> None:
-        # Tenant resolution is an authorization decision, as on the sealed
+    def list_encrypted_events(self, raw_query: str) -> None:
+        # As on every sealed-record entry point, identity is an authorization
+        # decision and precedes every query-parameter check.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        limit: int | None = None
+        cursor: str | None = None
+        after_value: str | None = None
+        for segment in raw_query.split("&") if raw_query else ():
+            name, equals, value = segment.partition("=")
+            if not equals:
+                continue
+            if name == "limit":
+                # Same paging-size rule as the batch listing: pure ASCII
+                # digits, 1..100, leading zeros allowed; duplicate -> 400.
+                if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= MAX_PAGE_LIMIT:
+                    self.error(400, "invalid_request")
+                    return
+                if limit is not None:
+                    self.error(400, "invalid_request")
+                    return
+                limit = int(value)
+            elif name == "cursor":
+                if cursor is not None:
+                    self.error(400, "invalid_request")
+                    return
+                cursor = value
+            elif name == "after_seq":
+                if after_value is not None:
+                    self.error(400, "invalid_request")
+                    return
+                after_value = value
+            # Any other query parameter is ignored.
+        if cursor is not None and after_value is not None:
+            # Continuation and a fresh start address are mutually exclusive.
+            self.error(400, "invalid_request")
+            return
+        after_seq: int | None = None
+        if cursor is None:
+            # Pure ASCII digits, 0..2^63-1, leading zeros allowed; empty,
+            # signed or decimal-pointed values (including full-width digits)
+            # are 400. The value is judged numerically, so an arbitrarily
+            # zero-padded maximum still passes while an over-maximum value of
+            # any length fails -- Python ints cannot overflow on the compare.
+            if after_value is None:
+                after_seq = 0
+            elif not after_value.isascii() or not after_value.isdigit():
+                self.error(400, "invalid_request")
+                return
+            else:
+                # Judge numerically rather than by raw length so an arbitrarily
+                # zero-padded maximum passes; stripping the zeros first also
+                # keeps an absurdly long digit string from hitting Python's
+                # int-string conversion limit (which must not surface as 500).
+                significant = after_value.lstrip("0") or "0"
+                if len(significant) > 19 or int(significant) > MAX_EVENT_SEQ:
+                    self.error(400, "invalid_request")
+                    return
+                after_seq = int(significant)
+        if limit is None:
+            limit = DEFAULT_PAGE_LIMIT
+        items, high_water, next_cursor = self.server.ledger.list_encrypted_record_events(
+            tenant, limit, after_seq, cursor
+        )
+        body = {"items": items, "high_water": high_water}
+        if next_cursor is not None:
+            body["next_cursor"] = next_cursor
+        self.send_json(200, body)
+
+    def get_encrypted_batch(self, batch_id: str) -> None:        # Tenant resolution is an authorization decision, as on the sealed
         # ingress: a missing/invalid header fails before the batch id is read.
         tenant = self.tenant()
         if tenant is None:

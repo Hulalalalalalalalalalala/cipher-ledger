@@ -93,6 +93,11 @@ ENCRYPTED_BATCH_ID = re.compile(r"batch_[0-9a-f]{32}\Z")
 # from replaying on the other even though they share one HMAC key.
 RECORD_LIST_CURSOR_NAMESPACE = "records"
 BATCH_LIST_CURSOR_NAMESPACE = "encrypted-batches"
+EVENT_LIST_CURSOR_NAMESPACE = "encrypted-record-events"
+
+# Append-event sequences are signed 64-bit integers; after_seq/high_water
+# cursors never carry a value outside this range.
+MAX_EVENT_SEQ = 9_223_372_036_854_775_807
 
 
 def _json_semantic_equal(left: object, right: object) -> bool:
@@ -271,9 +276,32 @@ class Ledger:
     def _issue_cursor(
         self, namespace: str, token: str, offset: int, tenant: str
     ) -> str:
+        return self._issue_cursor_payload(
+            namespace, {"t": token, "o": offset, "n": tenant}
+        )
+
+    def _parse_cursor(self, namespace: str, cursor: str) -> tuple[str, int]:
+        payload = self._parse_cursor_payload(namespace, cursor)
+        try:
+            token_hex = payload["t"]
+            offset = payload["o"]
+            cursor_tenant = payload["n"]
+        except (KeyError, TypeError):
+            raise invalid_request() from None
+        if (
+            not isinstance(token_hex, str)
+            or not isinstance(cursor_tenant, str)
+            or type(offset) is not int
+            or len(token_hex) not in (32, 36)
+            or not all(char in "0123456789abcdef" for char in token_hex)
+        ):
+            raise invalid_request()
+        return token_hex, offset
+
+    def _issue_cursor_payload(self, namespace: str, payload: dict) -> str:
         body = base64.urlsafe_b64encode(
             json.dumps(
-                {"ns": namespace, "t": token, "o": offset, "n": tenant},
+                {"ns": namespace, **payload},
                 separators=(",", ":"),
             ).encode("utf-8")
         )
@@ -284,7 +312,7 @@ class Ledger:
         encoded_tag = base64.urlsafe_b64encode(tag).rstrip(b"=")
         return (encoded_body + b"." + encoded_tag).decode("ascii")
 
-    def _parse_cursor(self, namespace: str, cursor: str) -> tuple[str, int]:
+    def _parse_cursor_payload(self, namespace: str, cursor: str) -> dict:
         try:
             body, encoded_tag = cursor.encode("ascii").split(b".", 1)
             tag = base64.urlsafe_b64decode(encoded_tag + b"=" * (-len(encoded_tag) % 4))
@@ -293,29 +321,16 @@ class Ledger:
                 raise invalid_request()
             decoded_body = base64.urlsafe_b64decode(body + b"=" * (-len(body) % 4))
             payload = json.loads(decoded_body)
-            cursor_namespace = payload["ns"]
-            token_hex = payload["t"]
-            offset = payload["o"]
-            cursor_tenant = payload["n"]
         except (
             UnicodeEncodeError,
             ValueError,
-            KeyError,
             TypeError,
             binascii.Error,
         ):
             raise invalid_request() from None
-        if (
-            not isinstance(payload, dict)
-            or cursor_namespace != namespace
-            or not isinstance(token_hex, str)
-            or not isinstance(cursor_tenant, str)
-            or type(offset) is not int
-            or len(token_hex) not in (32, 36)
-            or not all(char in "0123456789abcdef" for char in token_hex)
-        ):
+        if not isinstance(payload, dict) or payload.get("ns") != namespace:
             raise invalid_request()
-        return token_hex, offset
+        return payload
 
     @property
     def active_version(self) -> int:
@@ -1132,6 +1147,219 @@ class Ledger:
             return value
 
         return decode(summary[0]), decode(summary[1]), decode(summary[2])
+
+    # -- append-event listing ----------------------------------------------
+
+    def list_encrypted_record_events(
+        self,
+        tenant: str,
+        limit: int,
+        after_seq: int | None = None,
+        cursor: str | None = None,
+    ) -> tuple[list[dict], int, str | None]:
+        """Incrementally list this tenant's append events from one serial point.
+
+        A request without a cursor fixes one complete serial instant: the water
+        is ``max(after_seq, this tenant's largest committed seq)`` -- an empty
+        tenant has largest seq 0 -- and only events with
+        ``after_seq < seq <= water`` are ever served by this query chain.
+        Batches committed afterwards stay invisible until the caller starts a
+        fresh cursorless query using the returned ``high_water`` as its new
+        ``after_seq``. Sequence gaps are legitimate; the ordinary
+        server-encrypted ``records`` table and other tenants' events never
+        appear.
+
+        A continuation cursor freezes (tenant, after_seq, water); a later page
+        may use a different ``limit`` and replays deterministically, including
+        across a normal restart -- the cursor carries no server-side snapshot
+        state, only HMAC-signed integers. Key rotation does not touch these
+        tables and cannot change the result.
+
+        As on the cross-batch record read, every batch touched by the served
+        page is loaded whole (batch row, every record, every event) and passes
+        the same whole-batch consistency and stored-shape review before the
+        page is returned; a missing, malformed or foreign associated batch is
+        422. Corruption in a batch the page does not touch is irrelevant.
+
+        Read-only: no batch, record, event or idempotency binding is added or
+        changed. Returns (items, high_water, next_cursor_or_None); each item is
+        {"seq", "batch_id", "id", "position", "created_at"} in ascending seq,
+        and no ciphertext or envelope material is included.
+        """
+        with self._lock:
+            if cursor is None:
+                # One serial instant: the maximum read and the page reads all
+                # run under the process-wide lock, so no commit can interleave.
+                try:
+                    max_row = self._connection.execute(
+                        "SELECT MAX(seq) FROM encrypted_record_events WHERE tenant=?",
+                        (tenant,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    raise storage() from None
+                current_max = max_row[0]
+                if current_max is None:
+                    current_max = 0
+                elif type(current_max) is not int or current_max < 0:
+                    raise integrity()
+                start = after_seq
+                water = max(start, current_max)
+            else:
+                start, water = self._parse_event_cursor(tenant, cursor)
+
+            if not 0 <= start <= water <= MAX_EVENT_SEQ:
+                # A well-signed cursor whose bounds drifted out of range is
+                # stored-state corruption rather than a forged cursor.
+                raise integrity()
+
+            try:
+                # Fetch one extra row solely to learn whether another page
+                # exists. This also terminates the chain when the caller asked
+                # past the current tip (water pinned by after_seq): an empty
+                # remainder is a final page, never an endless run of empty
+                # pages whose cursor chases the water.
+                fetched = self._connection.execute(
+                    "SELECT seq, batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events "
+                    "WHERE tenant=? AND seq>? AND seq<=? "
+                    "ORDER BY seq ASC LIMIT ?",
+                    (tenant, start, water, limit + 1),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            has_more = len(fetched) > limit
+            event_rows = fetched[:limit]
+
+            # Identify every batch touched by this page (first-touch order).
+            # The associated ids come from stored rows and are themselves
+            # reviewed only after every read has succeeded.
+            batch_ids: list[str] = []
+            seen_batches: set[str] = set()
+            for event in event_rows:
+                if event["batch_id"] not in seen_batches:
+                    seen_batches.add(event["batch_id"])
+                    batch_ids.append(event["batch_id"])
+
+            # Read phase: the batch rows, every record and every append event
+            # of the involved batches are all fetched before any shape is
+            # reviewed, so a SQLite failure always surfaces as 503 rather than
+            # as a 422 built on partially read storage.
+            if batch_ids:
+                placeholders = ",".join("?" * len(batch_ids))
+                try:
+                    batch_rows = self._connection.execute(
+                        "SELECT batch_id, tenant, record_count, created_at "
+                        "FROM encrypted_batches WHERE batch_id IN (%s)" % placeholders,
+                        batch_ids,
+                    ).fetchall()
+                    record_rows = self._connection.execute(
+                        "SELECT tenant, id, batch_id, position, algorithm, encryption_key_id, "
+                        "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                        "FROM encrypted_records WHERE batch_id IN (%s) ORDER BY position ASC"
+                        % placeholders,
+                        batch_ids,
+                    ).fetchall()
+                    all_event_rows = self._connection.execute(
+                        "SELECT batch_id, tenant, record_id, position "
+                        "FROM encrypted_record_events WHERE batch_id IN (%s) ORDER BY seq ASC"
+                        % placeholders,
+                        batch_ids,
+                    ).fetchall()
+                except sqlite3.Error:
+                    raise storage() from None
+            else:
+                batch_rows = []
+                record_rows = []
+                all_event_rows = []
+
+            batches_by_id = {row["batch_id"]: row for row in batch_rows}
+            records_by_batch: dict[str, list] = {}
+            events_by_batch: dict[str, list] = {}
+            for row in record_rows:
+                records_by_batch.setdefault(row["batch_id"], []).append(row)
+            for event in all_event_rows:
+                events_by_batch.setdefault(event["batch_id"], []).append(event)
+
+            # Review phase: first the page's own event rows -- their stored
+            # types and their position in the fixed (start, water] window.
+            for event in event_rows:
+                if type(event["seq"]) is not int or not start < event["seq"] <= water:
+                    raise integrity()
+                if (
+                    event["tenant"] != tenant
+                    or not isinstance(event["record_id"], str)
+                    or type(event["position"]) is not int
+                    or not 0 <= event["position"] < MAX_ENCRYPTED_BATCH_SIZE
+                ):
+                    raise integrity()
+
+            # Then every involved batch as a whole, in first-touch order.
+            for batch_id in batch_ids:
+                # The associated batch id comes from stored rows, so its type
+                # and shape are themselves part of the review (a BLOB or
+                # malformed link is integrity drift), exactly as on the
+                # cross-batch sealed-record read.
+                if (
+                    not isinstance(batch_id, str)
+                    or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None
+                ):
+                    raise integrity()
+                batch = batches_by_id.get(batch_id)
+                # A dangling association (missing batch row) or one repointed
+                # at another tenant is a relationship failure.
+                if batch is None or batch["tenant"] != tenant:
+                    raise integrity()
+                self._validate_encrypted_batch(
+                    batch,
+                    records_by_batch.get(batch_id, []),
+                    events_by_batch.get(batch_id, []),
+                )
+
+            items: list[dict] = []
+            for event in event_rows:
+                batch = batches_by_id[event["batch_id"]]
+                items.append(
+                    {
+                        "seq": event["seq"],
+                        "batch_id": event["batch_id"],
+                        "id": event["record_id"],
+                        "position": event["position"],
+                        "created_at": batch["created_at"],
+                    }
+                )
+
+            end_seq = event_rows[-1]["seq"] if event_rows else start
+            next_cursor = (
+                self._issue_event_cursor(tenant, end_seq, water)
+                if has_more
+                else None
+            )
+            return items, water, next_cursor
+
+    def _issue_event_cursor(self, tenant: str, after_seq: int, water: int) -> str:
+        return self._issue_cursor_payload(
+            EVENT_LIST_CURSOR_NAMESPACE,
+            {"a": after_seq, "w": water, "n": tenant},
+        )
+
+    def _parse_event_cursor(self, tenant: str, cursor: str) -> tuple[int, int]:
+        """Validate an event-chain cursor for this tenant; (after_seq, water)."""
+        payload = self._parse_cursor_payload(EVENT_LIST_CURSOR_NAMESPACE, cursor)
+        try:
+            after_seq = payload["a"]
+            water = payload["w"]
+            cursor_tenant = payload["n"]
+        except (KeyError, TypeError):
+            raise invalid_request() from None
+        if (
+            not isinstance(cursor_tenant, str)
+            or cursor_tenant != tenant
+            or type(after_seq) is not int
+            or type(water) is not int
+            or not 0 <= after_seq <= water <= MAX_EVENT_SEQ
+        ):
+            raise invalid_request()
+        return after_seq, water
 
     def read(self, tenant: str, record_id: str) -> dict:
         with self._lock:
