@@ -87,6 +87,11 @@ MAX_ENCRYPTION_KEY_ID = 128
 MAX_METADATA_BYTES = 16384
 MAX_ENCRYPTED_BATCH_SIZE = 100
 ENCRYPTED_RECORD_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+ENCRYPTED_BATCH_ID = re.compile(r"batch_[0-9a-f]{32}\Z")
+# Name of the persisted HMAC secret that signs batch-list cursors. It lives in
+# service_metadata (never in the keyring), so record key rotation neither
+# changes cursor digests nor invalidates outstanding cursors.
+BATCH_LIST_CURSOR_SECRET_KEY = "batch_list_cursor_secret"
 
 
 def _json_semantic_equal(left: object, right: object) -> bool:
@@ -173,6 +178,9 @@ class Ledger:
         if active not in self._keys:
             raise ValueError("Invalid keyring configuration")
         self._active_version = active
+        # The batch-list cursor secret is independent of the record keyring:
+        # rotating record keys never touches it, so cursor digests are stable.
+        self._batch_cursor_secret = self._load_or_create_batch_cursor_secret()
 
     # -- record listing ----------------------------------------------------
 
@@ -267,6 +275,257 @@ class Ledger:
         ):
             raise invalid_request()
         return token_hex, offset
+
+    def _load_or_create_batch_cursor_secret(self) -> bytes:
+        """Load the persistent cursor-signing secret, creating it once.
+
+        The secret lives in service_metadata rather than the record keyring, so
+        key rotation leaves it and every outstanding cursor digest untouched,
+        and a normal restart reloads the identical bytes, keeping cursors valid.
+        """
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM service_metadata WHERE name=?",
+                (BATCH_LIST_CURSOR_SECRET_KEY,),
+            ).fetchone()
+            if row is not None:
+                raw = binascii.unhexlify(row[0])
+                if len(raw) == 32:
+                    return raw
+            secret = os.urandom(32)
+            with self._connection:
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",
+                    (BATCH_LIST_CURSOR_SECRET_KEY, secret.hex()),
+                )
+            row = self._connection.execute(
+                "SELECT value FROM service_metadata WHERE name=?",
+                (BATCH_LIST_CURSOR_SECRET_KEY,),
+            ).fetchone()
+            raw = binascii.unhexlify(row[0])
+        except (sqlite3.Error, TypeError, ValueError, binascii.Error) as exc:
+            raise ValueError("Invalid persisted cursor secret") from exc
+        if len(raw) != 32:
+            raise ValueError("Invalid persisted cursor secret")
+        return raw
+
+    # -- client-encrypted batch listing ------------------------------------
+
+    def list_encrypted_batches(
+        self, tenant: str, limit: int, cursor: str | None
+    ) -> tuple[list[dict], str | None]:
+        """List one tenant's committed batch summaries from a frozen snapshot.
+
+        A request without a cursor captures, at one serial point under the
+        process-wide lock, every fully committed batch the tenant owns in
+        batch_id ASCII order; the summaries are copied into an immutable
+        snapshot. Later pages addressed by the returned opaque cursor replay
+        only that snapshot, so concurrent commits (and idempotent replays,
+        which write nothing) neither duplicate nor omit entries, and a new
+        batch only appears through a fresh cursor-less request. The batch
+        write is a single transaction, hence a snapshot observes either the
+        complete batch or none of it -- never a partial commit.
+
+        Only the summary shape is checked here (batch_id format, integer
+        count in 1..100, string created_at); the records and append events of
+        each batch stay the responsibility of the whole-batch read. Read-only
+        with respect to protocol state -- the snapshot is query bookkeeping;
+        it never adds a batch, record, event or idempotency binding.
+
+        Returns (items, next_cursor_or_None). Each item is
+        {"batch_id", "count", "created_at"} with the same values a batch read
+        returns. A malformed/foreign cursor is 400 invalid_request, a SQLite
+        failure 503 storage_error, and any malformed captured summary 422
+        integrity_error; errors carry no partial page.
+        """
+        with self._lock:
+            if cursor is None:
+                summaries = self._load_committed_batch_summaries(tenant)
+                total = len(summaries)
+                # Only the page being returned is shape-checked; a corrupt
+                # summary sorting beyond this page does not spoil the page.
+                items = [self._batch_summary_value(row) for row in summaries[:limit]]
+                # Single-page listings (including an empty tenant) never hand
+                # out a cursor, so they retain no state and write nothing; only
+                # a multi-page snapshot is frozen for replay.
+                if total > limit:
+                    snapshot_id = self._persist_batch_snapshot(tenant, summaries)
+                else:
+                    snapshot_id = None
+                offset = 0
+            else:
+                snapshot_id, offset = self._parse_batch_cursor(cursor)
+                snapshot = self._load_batch_snapshot(snapshot_id)
+                if snapshot is None or snapshot["tenant"] != tenant:
+                    raise invalid_request()
+                total = snapshot["total"]
+                if not 0 <= offset <= total:
+                    raise invalid_request()
+
+                if offset < total:
+                    entries = self._load_batch_snapshot_entries(snapshot_id, offset, limit)
+                    # Offset+limit pages were sliced at issue time, so a short
+                    # or reordered read here means snapshot storage drifted.
+                    if len(entries) != min(limit, total - offset) or any(
+                        row["position"] != offset + index
+                        for index, row in enumerate(entries)
+                    ):
+                        raise integrity()
+                    items = [self._batch_summary_value(row) for row in entries]
+                else:
+                    items = []
+
+            end = offset + len(items)
+            next_cursor = (
+                self._issue_batch_cursor(snapshot_id, end, tenant) if end < total else None
+            )
+            return items, next_cursor
+
+    def _load_committed_batch_summaries(self, tenant: str):
+        """Read the tenant's committed batch summary rows in batch_id order.
+
+        Runs under the process-wide lock and reads only committed rows, so the
+        result is one complete serial state: a concurrent commit is visible
+        either wholesale or not at all. Rows are returned raw and shape-checked
+        only for the page actually served; internal records/events are not
+        consulted -- that review belongs to the whole-batch read.
+        """
+        try:
+            return self._connection.execute(
+                "SELECT batch_id, record_count, created_at FROM encrypted_batches "
+                "WHERE tenant=? ORDER BY batch_id ASC",
+                (tenant,),
+            ).fetchall()
+        except sqlite3.Error:
+            raise storage() from None
+
+    def _persist_batch_snapshot(self, tenant: str, rows) -> str:
+        """Freeze a multi-page snapshot; header and entries are one commit."""
+        snapshot_id = os.urandom(18).hex()
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            with self._connection:
+                self._connection.execute(
+                    "INSERT INTO encrypted_batch_list_snapshots "
+                    "(snapshot_id, tenant, created_at) VALUES (?, ?, ?)",
+                    (snapshot_id, tenant, created_at),
+                )
+                self._connection.executemany(
+                    "INSERT INTO encrypted_batch_list_entries "
+                    "(snapshot_id, position, batch_id, record_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (
+                            snapshot_id,
+                            position,
+                            row["batch_id"],
+                            row["record_count"],
+                            row["created_at"],
+                        )
+                        for position, row in enumerate(rows)
+                    ],
+                )
+        except sqlite3.Error:
+            raise storage() from None
+        return snapshot_id
+
+    def _batch_summary_value(self, row) -> dict:
+        """Shape-check one summary row and render its list item.
+
+        Only the list-level summary shape is reviewed: batch_id must be
+        ``batch_`` plus 32 lowercase hex digits, count an integer in 1..100 and
+        created_at a string. Any drift is 422 integrity_error; record and event
+        contents stay the responsibility of the whole-batch read.
+        """
+        batch_id = row["batch_id"]
+        count = row["record_count"]
+        created_at = row["created_at"]
+        if not isinstance(batch_id, str) or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None:
+            raise integrity()
+        if type(count) is not int or not 1 <= count <= MAX_ENCRYPTED_BATCH_SIZE:
+            raise integrity()
+        if not isinstance(created_at, str):
+            raise integrity()
+        return {"batch_id": batch_id, "count": count, "created_at": created_at}
+
+    def _load_batch_snapshot(self, snapshot_id: str) -> dict | None:
+        """Return snapshot header plus its entry count, or None if absent."""
+        try:
+            header = self._connection.execute(
+                "SELECT snapshot_id, tenant FROM encrypted_batch_list_snapshots "
+                "WHERE snapshot_id=?",
+                (snapshot_id,),
+            ).fetchone()
+            if header is None:
+                return None
+            total = self._connection.execute(
+                "SELECT COUNT(*) FROM encrypted_batch_list_entries WHERE snapshot_id=?",
+                (snapshot_id,),
+            ).fetchone()[0]
+        except sqlite3.Error:
+            raise storage() from None
+        if type(total) is not int:
+            raise integrity()
+        return {"tenant": header["tenant"], "total": total}
+
+    def _load_batch_snapshot_entries(self, snapshot_id: str, offset: int, limit: int):
+        try:
+            return self._connection.execute(
+                "SELECT position, batch_id, record_count, created_at "
+                "FROM encrypted_batch_list_entries "
+                "WHERE snapshot_id=? AND position>=? AND position<? "
+                "ORDER BY position ASC",
+                (snapshot_id, offset, offset + limit),
+            ).fetchall()
+        except sqlite3.Error:
+            raise storage() from None
+
+    def _issue_batch_cursor(self, snapshot_id: str, offset: int, tenant: str) -> str:
+        body = base64.urlsafe_b64encode(
+            json.dumps(
+                {"s": snapshot_id, "o": offset, "n": tenant},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        # Omit base64 padding ("=") so the opaque cursor carries safely in a
+        # query string; padding is restored on parse.
+        encoded_body = body.rstrip(b"=")
+        tag = hmac.new(self._batch_cursor_secret, encoded_body, hashlib.sha256).digest()
+        encoded_tag = base64.urlsafe_b64encode(tag).rstrip(b"=")
+        return (encoded_body + b"." + encoded_tag).decode("ascii")
+
+    def _parse_batch_cursor(self, cursor: str) -> tuple[str, int]:
+        try:
+            body, encoded_tag = cursor.encode("ascii").split(b".", 1)
+            tag = base64.urlsafe_b64decode(encoded_tag + b"=" * (-len(encoded_tag) % 4))
+            expected = hmac.new(
+                self._batch_cursor_secret, body, hashlib.sha256
+            ).digest()
+            if len(tag) != 32 or not hmac.compare_digest(tag, expected):
+                raise invalid_request()
+            decoded_body = base64.urlsafe_b64decode(body + b"=" * (-len(body) % 4))
+            payload = json.loads(decoded_body)
+            snapshot_id = payload["s"]
+            offset = payload["o"]
+            cursor_tenant = payload["n"]
+        except (
+            UnicodeEncodeError,
+            ValueError,
+            KeyError,
+            TypeError,
+            binascii.Error,
+        ):
+            raise invalid_request() from None
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(snapshot_id, str)
+            or not isinstance(cursor_tenant, str)
+            or type(offset) is not int
+            or len(snapshot_id) != 36
+            or not all(char in "0123456789abcdef" for char in snapshot_id)
+        ):
+            raise invalid_request()
+        return snapshot_id, offset
 
     @property
     def active_version(self) -> int:

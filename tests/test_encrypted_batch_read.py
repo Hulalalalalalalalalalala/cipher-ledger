@@ -298,9 +298,17 @@ class EncryptedBatchReadTests(unittest.TestCase):
         self.assertEqual(self.get_batch(batch_id, tenant="alpha"),
                          (422, {"error": "integrity_error"}))
 
-    def test_collection_path_is_not_a_route(self):
-        self.assertEqual(self.request("GET", "/v1/encrypted-records/batches"),
-                         (404, {"error": "not_found"}))
+    def test_collection_path_lists_batches_for_a_valid_tenant(self):
+        # The collection route now serves the batch listing; without a tenant
+        # header it is forbidden, with one it answers the listing shape.
+        self.assertEqual(self.request("GET", "/v1/encrypted-records/batches", None, tenant=None),
+                         (403, {"error": "TENANT_RECORD_FORBIDDEN"}))
+        self.assertEqual(self.request("GET", "/v1/encrypted-records/batches", None),
+                         (200, {"items": []}))
+        batch_id = self.ingest([sealed_record("a")])[1]["batch_id"]
+        status, body = self.request("GET", "/v1/encrypted-records/batches", None)
+        self.assertEqual(status, 200)
+        self.assertEqual([item["batch_id"] for item in body["items"]], [batch_id])
 
     # -- integrity: batch/records/events drift -----------------------------
 

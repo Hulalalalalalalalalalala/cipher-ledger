@@ -36,6 +36,38 @@ def is_ident(value: object) -> bool:
     return isinstance(value, str) and IDENT_PATTERN.fullmatch(value) is not None
 
 
+def parse_pagination(raw_query: str) -> tuple[int | None, str | None] | None:
+    """Parse optional ``limit``/``cursor`` query parameters.
+
+    Returns (limit_or_None, cursor_or_None); None signals invalid_request: a
+    limit that is not pure ASCII digits within 1..100, or a repeated limit /
+    cursor parameter. Unknown parameters and valueless segments are ignored
+    by design, and an empty ``cursor=`` value is left for the ledger to
+    reject as an invalid cursor.
+    """
+    limit: int | None = None
+    cursor: str | None = None
+    for segment in raw_query.split("&") if raw_query else ():
+        name, equals, value = segment.partition("=")
+        if not equals:
+            continue
+        if name == "limit":
+            if (
+                not value.isascii()
+                or not value.isdigit()
+                or not 1 <= int(value) <= MAX_PAGE_LIMIT
+            ):
+                return None
+            if limit is not None:
+                return None
+            limit = int(value)
+        elif name == "cursor":
+            if cursor is not None:
+                return None
+            cursor = value
+    return limit, cursor
+
+
 def valid_plaintext(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -120,6 +152,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"active_version": self.server.ledger.active_version})
             elif path == "/v1/records":
                 self.list_records(split.query)
+            elif path == "/v1/encrypted-records/batches":
+                self.list_encrypted_batches(split.query)
             elif path.startswith("/v1/records/"):
                 self.get_record(path[len("/v1/records/") :])
             elif path.startswith("/v1/encrypted-records/batches/"):
@@ -157,30 +191,14 @@ class LedgerHandler(BaseHTTPRequestHandler):
 
     def list_records(self, raw_query: str) -> None:
         tenant = self.tenant()
-        limit: int | None = None
-        cursor: str | None = None
         if tenant is None:
             self.error(400, "invalid_request")
             return
-        for segment in raw_query.split("&") if raw_query else ():
-            name, equals, value = segment.partition("=")
-            if not equals:
-                continue
-            if name == "limit":
-                # Pure ASCII digits, 1..100; duplicate or malformed -> 400.
-                if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= MAX_PAGE_LIMIT:
-                    self.error(400, "invalid_request")
-                    return
-                if limit is not None:
-                    self.error(400, "invalid_request")
-                    return
-                limit = int(value)
-            elif name == "cursor":
-                if cursor is not None:
-                    self.error(400, "invalid_request")
-                    return
-                cursor = value
-            # Any other query parameter is ignored.
+        parsed = parse_pagination(raw_query)
+        if parsed is None:
+            self.error(400, "invalid_request")
+            return
+        limit, cursor = parsed
         if limit is None:
             limit = DEFAULT_PAGE_LIMIT
         items, next_cursor = self.server.ledger.list_records(tenant, limit, cursor)
@@ -447,6 +465,29 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 "results": [{"id": record_id, "status": "created"} for record_id in record_ids],
             },
         )
+
+    def list_encrypted_batches(self, raw_query: str) -> None:
+        # Tenant resolution is an authorization decision on this collection,
+        # exactly as on the sealed ingress and single-batch read: a missing or
+        # unverifiable identity fails 403 before any parameter is inspected.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        parsed = parse_pagination(raw_query)
+        if parsed is None:
+            self.error(400, "invalid_request")
+            return
+        limit, cursor = parsed
+        if limit is None:
+            limit = DEFAULT_PAGE_LIMIT
+        items, next_cursor = self.server.ledger.list_encrypted_batches(
+            tenant, limit, cursor
+        )
+        body = {"items": items}
+        if next_cursor is not None:
+            body["next_cursor"] = next_cursor
+        self.send_json(200, body)
 
     def get_encrypted_batch(self, batch_id: str) -> None:
         # Tenant resolution is an authorization decision, as on the sealed

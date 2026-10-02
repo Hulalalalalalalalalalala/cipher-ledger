@@ -95,6 +95,29 @@ def initialize(database: str | Path, initial_version: int | None = None) -> None
                 "created_at TEXT NOT NULL, "
                 "PRIMARY KEY (tenant, idempotency_key))"
             )
+            # Immutable, self-contained snapshots behind one list cursor. A
+            # cursor-less list request captures the tenant's committed batch
+            # summaries in a single serial state; every later page addressed by
+            # the returned cursor replays that same state. The summaries are
+            # copied (never referenced live), so later commits and key rotation
+            # cannot change a page and cursors stay valid across restarts. The
+            # snapshot header and its entries are one transaction, which is the
+            # visibility boundary: a snapshot is never observed half populated.
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_batch_list_snapshots ("
+                "snapshot_id TEXT NOT NULL PRIMARY KEY, "
+                "tenant TEXT NOT NULL, "
+                "created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_batch_list_entries ("
+                "snapshot_id TEXT NOT NULL, "
+                "position INTEGER NOT NULL, "
+                "batch_id TEXT NOT NULL, "
+                "record_count INTEGER NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "PRIMARY KEY (snapshot_id, position)) WITHOUT ROWID"
+            )
             if initial_version is not None:
                 connection.execute(
                     "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",

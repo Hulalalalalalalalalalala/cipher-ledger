@@ -38,6 +38,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `POST /v1/records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}` | `200 {"items":[{"id":"invoice_1","plaintext":"...","key_version":1}, ...]}` |
 | `POST /v1/encrypted-records/batch` | 租户头；可选 `Idempotency-Key` 头；调用方已密封的记录集合（见下） | 新键 `201 {"batch_id":"batch_…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...]}`；同键同内容重放 `200`，正文与首次成功一致 |
 | `GET /v1/encrypted-records/batches/{batch_id}` | 租户头；批号为 `batch_` 加 32 个小写十六进制字符；查询参数忽略 | `200 {"batch_id":"…","count":2,"created_at":"…","records":[...]}`（见下） |
+| `GET /v1/encrypted-records/batches` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"batch_id":"…","count":2,"created_at":"…"}, ...],"next_cursor":"…"}`（末页省略 `next_cursor`；见下） |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
@@ -180,6 +181,42 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 
 该读取与本进程的并发密封写入、密钥轮换处于同一串行状态：要么看到写入前（404）要么看到完整提交后的整批，不能看到未提交批次的部分内容。密封记录不参与服务端密钥轮换，原有记录写入、读取、快照分页、健康检查与密钥管理的语义保持不变；日志不记录信封内容或密钥。
 
+### 查询租户批次清单 `GET /v1/encrypted-records/batches`
+
+该入口只读地列出当前租户**已完整提交**的客户端密封批次，不返回服务端加密的 `records` 记录。请求必须带合法的 `X-Tenant-ID`；成功返回 `200`，`items` 按 `batch_id` 的 ASCII 升序（SQLite BINARY 升序）排列，每项只含三个字段：
+
+```json
+{
+  "items": [
+    {"batch_id": "batch_0a1b…e8f9", "count": 2, "created_at": "2026-10-02T08:30:00+00:00"}
+  ],
+  "next_cursor": "<不透明游标>"
+}
+```
+
+- 每项的 `batch_id`、`count`、`created_at` 与按批号读取（上文整批读取）返回的值完全一致，但不包含 `records`；清单只复核摘要形状，批次内部的记录与追加事件仍由整批读取负责复核。
+- 空租户返回 `{"items":[]}`；只有确实存在后续页时才返回 `next_cursor`，末页省略该字段。
+- 既有批次无需重写即可列出；其他租户的批次以及服务端加密记录均不可见。
+
+#### 分页参数与快照
+
+可选查询参数 `limit`、`cursor`：`limit` 省略时默认 50，显式给出时必须是纯 ASCII 数字字符串且取值 1 到 100（允许 `01`、`007` 这类前导零），否则 `400 invalid_request`；同名 `limit` 或 `cursor` 参数重复出现同样为 `400 invalid_request`，其他查询参数一律忽略。
+
+- **首次无游标查询**固定一个完整串行提交状态：服务在进程级串行锁内把该租户当时已提交批次的摘要复制进一个不可变快照，后续带返回游标翻页只遍历该快照中的批次，不重复、不遗漏。期间新提交（含幂等重放，但重放本就不写入）不会进入既有遍历，必须重新发起一次无游标查询、取得新快照后才能看到。
+- **游标不透明**，绑定租户与首次查询状态，不自动过期；允许在续传时改用别的 `limit`，同一游标配合同一 `limit` 重复使用返回同一页。游标用存于 `service_metadata` 的独立 HMAC 密钥签名，该密钥不属于记录 keyring，因此**同一数据库正常重启后游标仍然有效，记录密钥轮换既不改变游标摘要也不使其失效**。
+- 清单查询不新增任何记录、批次、事件或幂等绑定；仅当结果超过一页时才写入仅供翻页用的快照簿记行，单页（含空租户）不留任何状态。
+
+#### 确定的错误结果与顺序
+
+错误响应只含 `{"error":"错误码"}`，不含部分页面，判定顺序固定：
+
+1. 缺少或非法的 `X-Tenant-ID`：`403 TENANT_RECORD_FORBIDDEN`，优先于一切参数判定。
+2. 租户有效后，非法 `limit`、空或无效的 `cursor`、属于其他租户的游标，以及同名 `limit`/`cursor` 重复：`400 invalid_request`；其他查询参数忽略。
+3. 参数合法后发生 SQLite 读取失败：`503 storage_error`。
+4. 待返回页中某批次摘要形状非法（`batch_id` 不合 `batch_` 加 32 个小写十六进制字符、`count` 非整数或不在 1 到 100、`created_at` 非字符串）：`422 integrity_error`。仅检查实际要返回的那一页，排在其后页次的损坏批次不影响当前页。
+
+该查询与本进程的并发密封提交等价于某个完整串行时刻：批次行与其记录、事件在同一事务提交，因此清单只能观察到完整批次或完全看不到，绝不会出现部分提交。
+
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
 
 ## 信封存储与兼容格式
@@ -200,7 +237,9 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 
 AAD 是 UTF-8 编码的无多余空白 JSON 数组。正文 AAD 为 `[1,"租户","记录id"]`，封装 AAD 为 `[1,"租户","记录id",密钥版本]`。数字 1 表示信封格式版本。标识符均为上述 ASCII 字符，因此不涉及字符串转义差异。这样导出的信封可用相同公开格式恢复。数据库中移植整组密文字段到其他租户或 id，或改变版本、nonce、密文和封装，应在读取时被拒绝；不能仅依靠查询过滤代替密码学绑定。
 
-客户端密封批量入口使用四张独立的表，均在同一次事务中写入：`encrypted_batches(batch_id, tenant, record_count, created_at)` 记录每个成功批次；`encrypted_records(tenant, id, batch_id, position, algorithm, encryption_key_id, envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata)` 以 `(tenant, id)` 为主键原样保存调用方提交的字节，与服务端加密的 `records` 表互不影响；`encrypted_record_events(seq, batch_id, tenant, record_id, position)` 是仅追加的账本，`seq` 单调递增，每条新可见记录对应一行；`encrypted_batch_idempotency_keys(tenant, idempotency_key, batch_id, created_at)` 以 `(tenant, idempotency_key)` 为主键记录幂等关联，仅在携带 `Idempotency-Key` 成功提交时与该批次同事务写入，旧批次没有对应行。批次任一步骤失败时这些表一起回滚，因此不会出现有记录无事件、有批次无记录，或有幂等关联却无完整批次的中间状态。该入口的信封不参与服务端密钥轮换（服务端不持有其封装密钥）。
+客户端密封批量入口使用四张协议表，均在同一次事务中写入：`encrypted_batches(batch_id, tenant, record_count, created_at)` 记录每个成功批次；`encrypted_records(tenant, id, batch_id, position, algorithm, encryption_key_id, envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata)` 以 `(tenant, id)` 为主键原样保存调用方提交的字节，与服务端加密的 `records` 表互不影响；`encrypted_record_events(seq, batch_id, tenant, record_id, position)` 是仅追加的账本，`seq` 单调递增，每条新可见记录对应一行；`encrypted_batch_idempotency_keys(tenant, idempotency_key, batch_id, created_at)` 以 `(tenant, idempotency_key)` 为主键记录幂等关联，仅在携带 `Idempotency-Key` 成功提交时与该批次同事务写入，旧批次没有对应行。批次任一步骤失败时这些表一起回滚，因此不会出现有记录无事件、有批次无记录，或有幂等关联却无完整批次的中间状态。该入口的信封不参与服务端密钥轮换（服务端不持有其封装密钥）。
+
+批次清单分页另用两张簿记表（非协议状态，不代表任何提交）：`encrypted_batch_list_snapshots(snapshot_id, tenant, created_at)` 与 `encrypted_batch_list_entries(snapshot_id, position, batch_id, record_count, created_at)`，两者在同一事务写入，仅在某次无游标查询结果超过一页时保存该时刻不可变的批次摘要副本；清单查询永不向上述四张协议表写入。游标签名密钥存于 `service_metadata` 的 `batch_list_cursor_secret`，与记录 keyring 相互独立。
 
 ## 轮换和并发边界
 
