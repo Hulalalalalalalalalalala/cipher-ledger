@@ -12,12 +12,14 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fractions import Fraction
 
 from . import envelope
 from .config import Config
@@ -68,6 +70,10 @@ def batch_write_failed() -> LedgerError:
     return LedgerError(500, "BATCH_WRITE_FAILED")
 
 
+def idempotency_conflict() -> LedgerError:
+    return LedgerError(409, "IDEMPOTENCY_CONFLICT")
+
+
 # Stored-shape limits mirrored from the sealed-write ingress. A batch read
 # re-validates every row against these before returning it, so a batch made
 # unreadable by offline tampering with types or lengths is reported as an
@@ -111,6 +117,55 @@ class EncryptedEntry:
     ciphertext_nonce: bytes
     tag: bytes | None
     metadata: str | None
+
+
+def _canonical_json(value) -> list:
+    """Type-tagged canonical form of one parsed JSON value.
+
+    Object members are sorted so key order and source whitespace vanish;
+    numbers (int and float alike) reduce to an exact Fraction so they compare
+    by value, while booleans keep their own tag and never equal a number.
+    """
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            # json.loads accepts NaN/Infinity; they have no Fraction form.
+            return ["num", repr(value)]
+        return ["num", str(Fraction(value))]
+    if isinstance(value, str):
+        return ["str", value]
+    if isinstance(value, list):
+        return ["list", [_canonical_json(item) for item in value]]
+    return ["obj", [[key, _canonical_json(item)] for key, item in sorted(value.items())]]
+
+
+def _batch_fingerprint(entries: list[EncryptedEntry]) -> str:
+    """Canonical content hash of one validated sealed batch.
+
+    Only the fields actually persisted take part, in submission order: record
+    id, algorithm, key_id (omitted == null), the decoded byte fields, and
+    metadata parsed into canonical form. Unknown request fields, JSON object
+    key order and formatting whitespace therefore cannot change the result.
+    """
+    canonical = [
+        [
+            entry.record_id,
+            entry.algorithm,
+            entry.encryption_key_id,
+            entry.envelope_nonce.hex(),
+            entry.wrapped_key.hex(),
+            entry.ciphertext.hex(),
+            entry.ciphertext_nonce.hex(),
+            entry.tag.hex() if entry.tag is not None else None,
+            None if entry.metadata is None else _canonical_json(json.loads(entry.metadata)),
+        ]
+        for entry in entries
+    ]
+    text = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class Ledger:
@@ -334,22 +389,35 @@ class Ledger:
     # -- client-encrypted batch ingress ------------------------------------
 
     def ingest_encrypted_batch(
-        self, tenant: str, entries: list[EncryptedEntry]
-    ) -> tuple[str, list[str]]:
+        self,
+        tenant: str,
+        entries: list[EncryptedEntry],
+        idempotency_headers: list[str] | None = None,
+    ) -> tuple[str, list[str], bool]:
         """Atomically commit one tenant's batch of pre-sealed records.
 
         The caller has already validated shape, types, supported algorithm and
         cross-field consistency. This method is the authoritative conflict and
-        commit boundary: it re-derives in-batch duplicate ids and existing ids
-        for this tenant (both INVALID_BATCH, never distinguished), then writes
-        the batch row, every record and an append-only event per record in a
-        single transaction. Any constraint violation, ledger-append failure or
-        storage error rolls the whole transaction back, leaving prior records
-        untouched and the new records invisible (BATCH_WRITE_FAILED).
+        commit boundary: it re-derives in-batch duplicate ids (INVALID_BATCH),
+        then resolves the optional Idempotency-Key association, and only then
+        checks existing ids for this tenant (INVALID_BATCH, never
+        distinguished from in-batch duplicates).
 
-        Runs under the process-wide lock, so a concurrent retry of the same
-        ids loses cleanly rather than landing a partial/duplicate batch.
-        Returns (batch_id, ids_in_input_order).
+        Idempotency-Key handling (absent header keeps the historical write
+        path exactly): an empty, malformed or repeated header is INVALID_BATCH
+        naming the header. A key already bound for this tenant replays the
+        first batch when the canonical content fingerprint matches (no new
+        batch, record or event is written) and is IDEMPOTENCY_CONFLICT when it
+        differs -- even if the new ids also happen to exist. A fresh key is
+        bound only inside the single transaction that writes the batch row,
+        every record and an append-only event per record, so any constraint
+        violation, ledger-append failure or storage error rolls everything
+        back: the key stays unbound, prior records and bindings stay
+        untouched, and the new records are invisible (BATCH_WRITE_FAILED).
+
+        Runs under the process-wide lock, so concurrent retries of the same
+        key serialize: one commit wins (201) and the rest observe the binding
+        (200 replay or 409). Returns (batch_id, ids_in_input_order, replayed).
         """
         with self._lock:
             record_ids = [entry.record_id for entry in entries]
@@ -361,6 +429,33 @@ class Ledger:
                         f"records[{index}].id is duplicated within the batch: {record_id}"
                     )
                 seen.add(record_id)
+
+            # The idempotency association is decided after shape and in-batch
+            # duplicate validation but before the existing-id conflict check.
+            idem_key = None
+            fingerprint = None
+            if idempotency_headers is not None:
+                if len(idempotency_headers) != 1 or ENCRYPTED_RECORD_ID.fullmatch(
+                    idempotency_headers[0]
+                ) is None:
+                    raise invalid_batch(
+                        "Idempotency-Key header must appear exactly once and match "
+                        "[A-Za-z0-9_-]{1,64}"
+                    )
+                idem_key = idempotency_headers[0]
+                fingerprint = _batch_fingerprint(entries)
+                try:
+                    bound = self._connection.execute(
+                        "SELECT batch_id, fingerprint FROM encrypted_idempotency_keys "
+                        "WHERE tenant=? AND idem_key=?",
+                        (tenant, idem_key),
+                    ).fetchone()
+                except sqlite3.Error:
+                    raise batch_write_failed() from None
+                if bound is not None:
+                    if bound["fingerprint"] != fingerprint:
+                        raise idempotency_conflict()
+                    return self._replay_idempotent_batch(tenant, bound["batch_id"])
 
             try:
                 rows = self._connection.execute(
@@ -413,12 +508,56 @@ class Ledger:
                             "(batch_id, tenant, record_id, position) VALUES (?, ?, ?, ?)",
                             (batch_id, tenant, entry.record_id, position),
                         )
+                    if idem_key is not None:
+                        # The binding commits together with the batch it names;
+                        # a rolled-back transaction never occupies the key.
+                        self._connection.execute(
+                            "INSERT INTO encrypted_idempotency_keys "
+                            "(tenant, idem_key, batch_id, fingerprint) VALUES (?, ?, ?, ?)",
+                            (tenant, idem_key, batch_id, fingerprint),
+                        )
             except sqlite3.Error:
                 # PRIMARY KEY/UNIQUE violations (a same-ids commit winning the
                 # race after the pre-check) and any ledger-append or storage
                 # failure all roll the transaction back; nothing is observable.
                 raise batch_write_failed() from None
-            return batch_id, record_ids
+            return batch_id, record_ids, False
+
+    def _replay_idempotent_batch(
+        self, tenant: str, batch_id: str
+    ) -> tuple[str, list[str], bool]:
+        """Return the stored outcome of an already-committed idempotent batch.
+
+        The binding is honored only if the referenced batch still exists,
+        belongs to the same tenant and passes the same whole-batch consistency
+        re-validation as the batch read endpoint; a missing batch, a
+        cross-tenant reference or any integrity drift is 422. Storage failures
+        while reading the association back are BATCH_WRITE_FAILED.
+        """
+        try:
+            batch = self._connection.execute(
+                "SELECT batch_id, tenant, record_count, created_at "
+                "FROM encrypted_batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if batch is not None:
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, batch_id, position, algorithm, encryption_key_id, "
+                    "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records WHERE batch_id=? ORDER BY position ASC",
+                    (batch_id,),
+                ).fetchall()
+                event_rows = self._connection.execute(
+                    "SELECT batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events WHERE batch_id=? ORDER BY seq ASC",
+                    (batch_id,),
+                ).fetchall()
+        except sqlite3.Error:
+            raise batch_write_failed() from None
+        if batch is None or batch["tenant"] != tenant:
+            raise integrity()
+        self._validate_encrypted_batch(batch, record_rows, event_rows)
+        return batch_id, [row["id"] for row in record_rows], True
 
     def read_encrypted_batch(self, tenant: str, batch_id: str) -> dict:
         """Return one client-sealed batch in submission order.

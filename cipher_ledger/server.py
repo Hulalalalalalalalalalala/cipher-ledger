@@ -413,9 +413,15 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 )
             )
 
-        batch_id, record_ids = self.server.ledger.ingest_encrypted_batch(tenant, entries)
+        # Optional Idempotency-Key: the raw header values are handed to the
+        # ledger, which validates and resolves them after the shape and
+        # in-batch duplicate checks above. Absent header -> historical write.
+        idempotency_headers = self.headers.get_all("Idempotency-Key")
+        batch_id, record_ids, replayed = self.server.ledger.ingest_encrypted_batch(
+            tenant, entries, idempotency_headers
+        )
         self.send_json(
-            201,
+            200 if replayed else 201,
             {
                 "batch_id": batch_id,
                 "count": len(record_ids),
