@@ -95,6 +95,45 @@ def initialize(database: str | Path, initial_version: int | None = None) -> None
                 "created_at TEXT NOT NULL, "
                 "PRIMARY KEY (tenant, idempotency_key))"
             )
+            # Frozen snapshots behind GET .../batches pagination. A cursorless
+            # request captures one complete serial state: one snapshot row plus
+            # one item row per batch visible at that instant, committed in a
+            # single transaction. Later pages read those rows, so concurrent
+            # commits neither duplicate nor drop entries; the tables persist so
+            # a cursor keeps working across a normal database restart.
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_batch_list_snapshots ("
+                "snapshot_id TEXT NOT NULL PRIMARY KEY, "
+                "tenant TEXT NOT NULL, "
+                "total INTEGER NOT NULL, "
+                "created_at TEXT NOT NULL)"
+            )
+            # Upgrade a database created before ``total`` was recorded on the
+            # snapshot header; such databases contain no real snapshots, so the
+            # default is never observed by a cursor (a zero-item snapshot is
+            # itself treated as corruption).
+            snapshot_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(encrypted_batch_list_snapshots)"
+                )
+            }
+            if "total" not in snapshot_columns:
+                connection.execute(
+                    "ALTER TABLE encrypted_batch_list_snapshots "
+                    "ADD COLUMN total INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_batch_list_snapshot_items ("
+                "snapshot_id TEXT NOT NULL, "
+                "position INTEGER NOT NULL, "
+                # Compact JSON [batch_id, record_count, created_at]. JSON keeps
+                # the original stored types intact (unlike type-affinity
+                # columns), so a later page can still detect offline tampering
+                # such as a non-string created_at.
+                "summary TEXT NOT NULL, "
+                "PRIMARY KEY (snapshot_id, position))"
+            )
             if initial_version is not None:
                 connection.execute(
                     "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",

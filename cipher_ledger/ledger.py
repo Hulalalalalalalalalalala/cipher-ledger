@@ -87,6 +87,12 @@ MAX_ENCRYPTION_KEY_ID = 128
 MAX_METADATA_BYTES = 16384
 MAX_ENCRYPTED_BATCH_SIZE = 100
 ENCRYPTED_RECORD_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+ENCRYPTED_BATCH_ID = re.compile(r"batch_[0-9a-f]{32}\Z")
+
+# Namespacing the opaque cursors keeps a cursor minted by one listing endpoint
+# from replaying on the other even though they share one HMAC key.
+RECORD_LIST_CURSOR_NAMESPACE = "records"
+BATCH_LIST_CURSOR_NAMESPACE = "encrypted-batches"
 
 
 def _json_semantic_equal(left: object, right: object) -> bool:
@@ -161,7 +167,7 @@ class Ledger:
         self._keys = dict(config.keys)
         self._connection = connect(config.database)
         self._lock = threading.RLock()
-        self._cursor_secret = os.urandom(32)
+        self._cursor_secret = self._load_or_create_cursor_secret()
         self._snapshots: dict[str, _Snapshot] = {}
         try:
             row = self._connection.execute(
@@ -173,6 +179,41 @@ class Ledger:
         if active not in self._keys:
             raise ValueError("Invalid keyring configuration")
         self._active_version = active
+
+    def _load_or_create_cursor_secret(self) -> bytes:
+        """Return the persistent HMAC key for opaque list cursors.
+
+        The record listing keeps cursors in memory and tolerates them dying
+        with the process; the encrypted-batch listing promises cursors that
+        stay valid across a normal restart. One shared 32-byte secret stored in
+        service_metadata backs both: an existing value is always reused (and a
+        database lacking it is upgraded once), so restarting never changes a
+        minted digest or invalidates a cursor. It is independent of the keyring,
+        so rotating record keys leaves it untouched.
+        """
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM service_metadata WHERE name='cursor_secret'"
+            ).fetchone()
+            if row is not None:
+                secret = binascii.unhexlify(row[0])
+                if len(secret) == 32:
+                    return secret
+            secret = os.urandom(32)
+            with self._connection:
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",
+                    ("cursor_secret", secret.hex()),
+                )
+            row = self._connection.execute(
+                "SELECT value FROM service_metadata WHERE name='cursor_secret'"
+            ).fetchone()
+            secret = binascii.unhexlify(row[0])
+        except (sqlite3.Error, ValueError, TypeError, binascii.Error):
+            # Persisting the HMAC key is an availability optimization; a
+            # storage problem here must not stop the service from starting.
+            secret = os.urandom(32)
+        return secret
 
     # -- record listing ----------------------------------------------------
 
@@ -207,7 +248,9 @@ class Ledger:
                 if len(snapshot.record_ids) > limit:
                     self._snapshots[token_hex] = snapshot
             else:
-                token_hex, offset = self._parse_cursor(cursor)
+                token_hex, offset = self._parse_cursor(
+                    RECORD_LIST_CURSOR_NAMESPACE, cursor
+                )
                 snapshot = self._snapshots.get(token_hex)
                 if snapshot is None or snapshot.tenant != tenant:
                     raise invalid_request()
@@ -217,16 +260,20 @@ class Ledger:
             end = offset + limit
             page = list(snapshot.record_ids[offset:end])
             next_cursor = (
-                self._issue_cursor(token_hex, end, tenant)
+                self._issue_cursor(
+                    RECORD_LIST_CURSOR_NAMESPACE, token_hex, end, tenant
+                )
                 if end < len(snapshot.record_ids)
                 else None
             )
             return page, next_cursor
 
-    def _issue_cursor(self, token_hex: str, offset: int, tenant: str) -> str:
+    def _issue_cursor(
+        self, namespace: str, token: str, offset: int, tenant: str
+    ) -> str:
         body = base64.urlsafe_b64encode(
             json.dumps(
-                {"t": token_hex, "o": offset, "n": tenant},
+                {"ns": namespace, "t": token, "o": offset, "n": tenant},
                 separators=(",", ":"),
             ).encode("utf-8")
         )
@@ -237,7 +284,7 @@ class Ledger:
         encoded_tag = base64.urlsafe_b64encode(tag).rstrip(b"=")
         return (encoded_body + b"." + encoded_tag).decode("ascii")
 
-    def _parse_cursor(self, cursor: str) -> tuple[str, int]:
+    def _parse_cursor(self, namespace: str, cursor: str) -> tuple[str, int]:
         try:
             body, encoded_tag = cursor.encode("ascii").split(b".", 1)
             tag = base64.urlsafe_b64decode(encoded_tag + b"=" * (-len(encoded_tag) % 4))
@@ -246,6 +293,7 @@ class Ledger:
                 raise invalid_request()
             decoded_body = base64.urlsafe_b64decode(body + b"=" * (-len(body) % 4))
             payload = json.loads(decoded_body)
+            cursor_namespace = payload["ns"]
             token_hex = payload["t"]
             offset = payload["o"]
             cursor_tenant = payload["n"]
@@ -259,10 +307,11 @@ class Ledger:
             raise invalid_request() from None
         if (
             not isinstance(payload, dict)
+            or cursor_namespace != namespace
             or not isinstance(token_hex, str)
             or not isinstance(cursor_tenant, str)
             or type(offset) is not int
-            or len(token_hex) != 36
+            or len(token_hex) not in (32, 36)
             or not all(char in "0123456789abcdef" for char in token_hex)
         ):
             raise invalid_request()
@@ -758,6 +807,208 @@ class Ledger:
                 raise integrity() from None
             if not isinstance(parsed, dict):
                 raise integrity()
+
+    def list_encrypted_batches(
+        self, tenant: str, limit: int, cursor: str | None
+    ) -> tuple[list[dict], str | None]:
+        """List a tenant's sealed-batch summaries from one frozen state.
+
+        A request without a cursor captures the tenant's current batches in
+        ascending batch_id order; the summary tuples are frozen into a snapshot
+        row set committed in a single transaction (once more than one page is
+        possible). Later pages addressed by the returned opaque cursor serve
+        only that frozen set, so concurrent commits neither duplicate nor drop
+        entries and batches committed afterwards stay invisible until a fresh
+        cursorless listing. Snapshots persist, so a cursor survives a normal
+        restart and is unaffected by key rotation.
+
+        Only the summary shape (batch_id/count/created_at) is reviewed here;
+        the per-batch records and append events remain the exclusive concern of
+        the whole-batch read. Read-only with respect to the protocol tables: it
+        adds no batches, records, events or idempotency bindings.
+        Returns (items, next_cursor_or_None).
+        """
+        with self._lock:
+            if cursor is None:
+                try:
+                    rows = self._connection.execute(
+                        "SELECT batch_id, record_count, created_at "
+                        "FROM encrypted_batches WHERE tenant=? ORDER BY batch_id ASC",
+                        (tenant,),
+                    ).fetchall()
+                except sqlite3.Error:
+                    raise storage() from None
+                summaries = [
+                    (row["batch_id"], row["record_count"], row["created_at"]) for row in rows
+                ]
+                total = len(summaries)
+                offset = 0
+                snapshot_id = os.urandom(16).hex()
+                # Review the page being returned before any snapshot state is
+                # written, so a 422 on the first page leaves no state behind.
+                page_summaries = summaries[:limit]
+                items = [self._batch_summary(*summary) for summary in page_summaries]
+                # As with record listings, a one-page answer hands out no
+                # cursor and therefore needs no retained snapshot.
+                if total > limit:
+                    try:
+                        with self._connection:
+                            self._connection.execute(
+                                "INSERT INTO encrypted_batch_list_snapshots "
+                                "(snapshot_id, tenant, total, created_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    snapshot_id,
+                                    tenant,
+                                    total,
+                                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                ),
+                            )
+                            self._connection.executemany(
+                                "INSERT INTO encrypted_batch_list_snapshot_items "
+                                "(snapshot_id, position, summary) VALUES (?, ?, ?)",
+                                [
+                                    (
+                                        snapshot_id,
+                                        position,
+                                        self._freeze_batch_summary(
+                                            batch_id, count, created_at
+                                        ),
+                                    )
+                                    for position, (
+                                        batch_id,
+                                        count,
+                                        created_at,
+                                    ) in enumerate(summaries)
+                                ],
+                            )
+                    except sqlite3.Error:
+                        raise storage() from None
+                # A malformed later batch is frozen untouched and only
+                # surfaces when its own page is served.
+            else:
+                snapshot_id, offset = self._parse_cursor(
+                    BATCH_LIST_CURSOR_NAMESPACE, cursor
+                )
+                try:
+                    snapshot = self._connection.execute(
+                        "SELECT tenant, total FROM encrypted_batch_list_snapshots "
+                        "WHERE snapshot_id=?",
+                        (snapshot_id,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    raise storage() from None
+                # Unknown snapshot (e.g. pruned or never minted) and a snapshot
+                # bound to another tenant are indistinguishable bad cursors.
+                if snapshot is None or snapshot["tenant"] != tenant:
+                    raise invalid_request()
+                total = snapshot["total"]
+                if type(total) is not int or total < 1:
+                    raise integrity()
+                try:
+                    actual_total = self._connection.execute(
+                        "SELECT COUNT(*) FROM encrypted_batch_list_snapshot_items "
+                        "WHERE snapshot_id=?",
+                        (snapshot_id,),
+                    ).fetchone()[0]
+                    rows = self._connection.execute(
+                        "SELECT position, summary "
+                        "FROM encrypted_batch_list_snapshot_items "
+                        "WHERE snapshot_id=? AND position>=? ORDER BY position ASC LIMIT ?",
+                        (snapshot_id, offset, limit),
+                    ).fetchall()
+                except sqlite3.Error:
+                    raise storage() from None
+                if not 0 <= offset <= total:
+                    raise invalid_request()
+                # The frozen item count is recorded on the header; missing or
+                # extra offline rows are integrity drift, never a silent gap.
+                if actual_total != total:
+                    raise integrity()
+                expected_count = min(limit, total - offset)
+                if len(rows) != expected_count:
+                    raise integrity()
+                page_summaries = []
+                for index, row in enumerate(rows):
+                    if row["position"] != offset + index:
+                        # Frozen positions must be contiguous from offset.
+                        raise integrity()
+                    try:
+                        summary = json.loads(row["summary"])
+                        batch_id, count, created_at = self._thaw_batch_summary(summary)
+                    except (LedgerError, ValueError, TypeError):
+                        # Corrupt frozen summary on the page being served.
+                        raise integrity() from None
+                    page_summaries.append(
+                        (batch_id, count, created_at)
+                    )
+                items = [self._batch_summary(*summary) for summary in page_summaries]
+
+            end = offset + limit
+            next_cursor = (
+                self._issue_cursor(BATCH_LIST_CURSOR_NAMESPACE, snapshot_id, end, tenant)
+                if end < total
+                else None
+            )
+            return items, next_cursor
+
+    def _batch_summary(self, batch_id: object, count: object, created_at: object) -> dict:
+        """Validate one stored summary tuple; raise 422 on any shape drift."""
+        if (
+            not isinstance(batch_id, str)
+            or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None
+            or type(count) is not int
+            or not 1 <= count <= MAX_ENCRYPTED_BATCH_SIZE
+            or not isinstance(created_at, str)
+        ):
+            raise integrity()
+        return {"batch_id": batch_id, "count": count, "created_at": created_at}
+
+    def _freeze_batch_summary(
+        self, batch_id: object, count: object, created_at: object
+    ) -> str:
+        """Type-tag one stored summary tuple as compact JSON.
+
+        Freezing preserves the *exact* stored types across SQLite's type
+        affinity -- notably a non-string BLOB in a TEXT-affinity column -- so a
+        later page can still raise 422 on it. A value whose type cannot appear
+        in a column declared here is encoded as an explicit marker rather than
+        raising, keeping snapshot creation from failing on a malformed page the
+        caller never requests.
+        """
+        def encode(value: object) -> object:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, bytes):
+                return {"__blob__": base64.b64encode(value).decode("ascii")}
+            return {"__invalid__": True}
+
+        return json.dumps(
+            [encode(batch_id), encode(count), encode(created_at)],
+            separators=(",", ":"),
+        )
+
+    def _thaw_batch_summary(self, summary: object) -> tuple[object, object, object]:
+        """Reverse :meth:`_freeze_batch_summary`; 422 on an unreadable marker."""
+        if not isinstance(summary, list) or len(summary) != 3:
+            raise integrity()
+
+        def decode(value: object) -> object:
+            if isinstance(value, dict) and set(value) == {"__blob__"}:
+                encoded = value["__blob__"]
+                if not isinstance(encoded, str):
+                    raise integrity()
+                try:
+                    return base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError):
+                    raise integrity() from None
+            if isinstance(value, dict) and value.get("__invalid__") is True:
+                # An original type that could not be represented; validation
+                # below rejects it (it is not str/int).
+                return object()
+            return value
+
+        return decode(summary[0]), decode(summary[1]), decode(summary[2])
 
     def read(self, tenant: str, record_id: str) -> dict:
         with self._lock:

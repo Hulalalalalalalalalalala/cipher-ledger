@@ -38,6 +38,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `POST /v1/records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}` | `200 {"items":[{"id":"invoice_1","plaintext":"...","key_version":1}, ...]}` |
 | `POST /v1/encrypted-records/batch` | 租户头；可选 `Idempotency-Key` 头；调用方已密封的记录集合（见下） | 新键 `201 {"batch_id":"batch_…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...]}`；同键同内容重放 `200`，正文与首次成功一致 |
 | `GET /v1/encrypted-records/batches/{batch_id}` | 租户头；批号为 `batch_` 加 32 个小写十六进制字符；查询参数忽略 | `200 {"batch_id":"…","count":2,"created_at":"…","records":[...]}`（见下） |
+| `GET /v1/encrypted-records/batches` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"batch_id":"…","count":2,"created_at":"…"}, ...],"next_cursor":"..."}`（见下） |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
@@ -180,6 +181,23 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 
 该读取与本进程的并发密封写入、密钥轮换处于同一串行状态：要么看到写入前（404）要么看到完整提交后的整批，不能看到未提交批次的部分内容。密封记录不参与服务端密钥轮换，原有记录写入、读取、快照分页、健康检查与密钥管理的语义保持不变；日志不记录信封内容或密钥。
 
+### 查询租户批次清单 `GET /v1/encrypted-records/batches`
+
+该入口只读地列出当前租户成功提交的客户端密封批次摘要。请求头必须带合法的 `X-Tenant-ID`；成功返回 `200`，`items` 按 `batch_id` 的 ASCII 升序（SQLite BINARY）排列，每项只含 `batch_id`、`count`、`created_at`，取值与按批号整批读取一致。其他租户的批次以及服务端加密的普通记录均不可见；没有任何密封批次的租户返回 `200 {"items":[]}`。既有批次无需重写即可列出；该查询不新增任何记录、批次、追加事件或幂等绑定。清单只检查摘要形状，批次内部记录与事件的一致性仍由既有整批读取复核。
+
+分页沿用记录清单的口径：`limit` 省略时每页 50 项；显式给出时必须由纯 ASCII 数字组成且在 1 到 100 之间（`01`、`007` 等前导零可接受），否则 `400 invalid_request`。`limit` 或 `cursor` 同名参数重复出现均为 `400 invalid_request`，其他查询参数忽略。有后续页时响应才含 `next_cursor`，最后一页省略该字段。
+
+第一次不带 `cursor` 的请求在某个完整串行时刻冻结一次该租户的批次清单；后续沿 `next_cursor` 翻页时只遍历这次冻结集合，不重复、不漏项，期间新提交的批次必须重新发起一次不带游标的查询才能看到；失败写入与幂等重放都不会增加清单项。游标不透明，绑定租户与首次查询状态，不自动过期；允许在续传时换用不同的 `limit`，同一游标连同相同 `limit` 重复使用返回同一页。冻结状态持久化在数据库中，因此同一数据库正常重启后游标仍有效；游标签名密钥独立于 keyring 存于 `service_metadata`，密钥轮换既不改变摘要也不使游标失效。
+
+错误响应只含 `{"error":"错误码"}` 且不含部分页面，判定顺序固定：
+
+1. 缺少或非法的 `X-Tenant-ID`：`403 TENANT_RECORD_FORBIDDEN`，优先于一切查询参数判定。
+2. 租户合法后：非法 `limit`、空或无效 `cursor`、属于其他租户的游标，以及 `limit`/`cursor` 同名重复，均为 `400 invalid_request`；其他查询参数忽略。
+3. 参数合法后发生 SQLite 读取失败：`503 storage_error`。
+4. 待返回页中批号格式非法、`count` 非整数或超出 1 到 100、`created_at` 非字符串：`422 integrity_error`。后续页中的损坏摘要只在该页被请求时才报错，不影响其前各页。
+
+该查询与本进程的并发密封提交等价于一个完整串行时刻，只能看到提交前或完整提交后的清单，不观察部分提交。
+
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
 
 ## 信封存储与兼容格式
@@ -201,6 +219,8 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 AAD 是 UTF-8 编码的无多余空白 JSON 数组。正文 AAD 为 `[1,"租户","记录id"]`，封装 AAD 为 `[1,"租户","记录id",密钥版本]`。数字 1 表示信封格式版本。标识符均为上述 ASCII 字符，因此不涉及字符串转义差异。这样导出的信封可用相同公开格式恢复。数据库中移植整组密文字段到其他租户或 id，或改变版本、nonce、密文和封装，应在读取时被拒绝；不能仅依靠查询过滤代替密码学绑定。
 
 客户端密封批量入口使用四张独立的表，均在同一次事务中写入：`encrypted_batches(batch_id, tenant, record_count, created_at)` 记录每个成功批次；`encrypted_records(tenant, id, batch_id, position, algorithm, encryption_key_id, envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata)` 以 `(tenant, id)` 为主键原样保存调用方提交的字节，与服务端加密的 `records` 表互不影响；`encrypted_record_events(seq, batch_id, tenant, record_id, position)` 是仅追加的账本，`seq` 单调递增，每条新可见记录对应一行；`encrypted_batch_idempotency_keys(tenant, idempotency_key, batch_id, created_at)` 以 `(tenant, idempotency_key)` 为主键记录幂等关联，仅在携带 `Idempotency-Key` 成功提交时与该批次同事务写入，旧批次没有对应行。批次任一步骤失败时这些表一起回滚，因此不会出现有记录无事件、有批次无记录，或有幂等关联却无完整批次的中间状态。该入口的信封不参与服务端密钥轮换（服务端不持有其封装密钥）。
+
+批次清单分页另用两张仅服务于冻结快照的表：`encrypted_batch_list_snapshots(snapshot_id, tenant, total, created_at)` 记录每次多页首次查询的冻结状态与当时的批次总数，`encrypted_batch_list_snapshot_items(snapshot_id, position, summary)` 以紧凑且保留原始存储类型的 JSON 保存当时的 `[batch_id, record_count, created_at]` 摘要；二者在同一事务中写入，查询本身不改动上述四张协议表，离线删改快照行导致总数不符或位置不连续时按 `422 integrity_error` 处理。游标签名密钥存于 `service_metadata`（`name='cursor_secret'`），与记录清单游标共用，因此游标可在正常重启后继续使用。
 
 ## 轮换和并发边界
 

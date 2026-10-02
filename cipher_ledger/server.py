@@ -122,6 +122,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.list_records(split.query)
             elif path.startswith("/v1/records/"):
                 self.get_record(path[len("/v1/records/") :])
+            elif path == "/v1/encrypted-records/batches":
+                self.list_encrypted_batches(split.query)
             elif path.startswith("/v1/encrypted-records/batches/"):
                 # Any query string is part of the route split but ignored.
                 self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
@@ -447,6 +449,42 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 "results": [{"id": record_id, "status": "created"} for record_id in record_ids],
             },
         )
+
+    def list_encrypted_batches(self, raw_query: str) -> None:
+        # As on the sealed ingress, identity is an authorization decision and
+        # precedes every query-parameter check.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        limit: int | None = None
+        cursor: str | None = None
+        for segment in raw_query.split("&") if raw_query else ():
+            name, equals, value = segment.partition("=")
+            if not equals:
+                continue
+            if name == "limit":
+                # Pure ASCII digits, 1..100; duplicate or malformed -> 400.
+                if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= MAX_PAGE_LIMIT:
+                    self.error(400, "invalid_request")
+                    return
+                if limit is not None:
+                    self.error(400, "invalid_request")
+                    return
+                limit = int(value)
+            elif name == "cursor":
+                if cursor is not None:
+                    self.error(400, "invalid_request")
+                    return
+                cursor = value
+            # Any other query parameter is ignored.
+        if limit is None:
+            limit = DEFAULT_PAGE_LIMIT
+        items, next_cursor = self.server.ledger.list_encrypted_batches(tenant, limit, cursor)
+        body = {"items": items}
+        if next_cursor is not None:
+            body["next_cursor"] = next_cursor
+        self.send_json(200, body)
 
     def get_encrypted_batch(self, batch_id: str) -> None:
         # Tenant resolution is an authorization decision, as on the sealed
