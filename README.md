@@ -39,6 +39,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `POST /v1/encrypted-records/batch` | 租户头；可选 `Idempotency-Key` 头；调用方已密封的记录集合（见下） | 新键 `201 {"batch_id":"batch_…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...]}`；同键同内容重放 `200`，正文与首次成功一致 |
 | `GET /v1/encrypted-records/batches/{batch_id}` | 租户头；批号为 `batch_` 加 32 个小写十六进制字符；查询参数忽略 | `200 {"batch_id":"…","count":2,"created_at":"…","records":[...]}`（见下） |
 | `GET /v1/encrypted-records/batches` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"batch_id":"…","count":2,"created_at":"…"}, ...],"next_cursor":"..."}`（见下） |
+| `POST /v1/encrypted-records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}`（1 到 100 个不重复 id）；查询参数与未列明字段忽略 | `200 {"count":2,"items":[...]}`（见下，按输入顺序跨批次返回） |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
@@ -197,6 +198,42 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 4. 待返回页中批号格式非法、`count` 非整数或超出 1 到 100、`created_at` 非字符串：`422 integrity_error`。后续页中的损坏摘要只在该页被请求时才报错，不影响其前各页。
 
 该查询与本进程的并发密封提交等价于一个完整串行时刻，只能看到提交前或完整提交后的清单，不观察部分提交。
+
+### 按记录 id 跨批次取回密封记录 `POST /v1/encrypted-records/batch/read`
+
+该入口只读地按记录 id 一次取回当前租户的多条客户端密封记录，这些记录可来自一个或多个批次。请求头必须带合法的 `X-Tenant-ID`；请求体是一个对象，`ids` 为 1 到 100 项的字符串数组，每个 id 匹配 `[A-Za-z0-9_-]{1,64}` 且批内不得重复；未列明的正文字段与任何查询参数一律忽略。成功返回 `200`：
+
+```json
+{
+  "count": 2,
+  "items": [
+    {
+      "id": "invoice_1",
+      "algorithm": "AES-256-GCM",
+      "key_id": "client-key-1",
+      "envelope": {"nonce": "<base64 12 字节>", "wrapped_key": "<base64 48 字节>"},
+      "ciphertext": {"data": "<base64 密文正文>", "nonce": "<base64 12 字节>", "tag": "<base64 16 字节>"},
+      "metadata": {"order": "A-100"},
+      "batch_id": "batch_0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "created_at": "2026-10-02T08:30:00+00:00"
+    }
+  ]
+}
+```
+
+- `count` 恒等于请求的 id 数（即返回条数，1 到 100）；`items` 严格按请求 id 的顺序排列，只包含被请求的记录。
+- 每条记录在按批号整批读取的记录结构上额外携带 `batch_id`（该记录所属批次）与 `created_at`（其批次提交时原样存库的字符串，同一批次的多条记录取值相同）。`id`、`algorithm`、`key_id`、`envelope`、`ciphertext`、`metadata` 各字段的 Base64、空密文、元数据与可选字段 `null` 口径与整批读取完全一致；服务同样不解密、不认证客户端密文，等长字节改动仍原样返回。
+- 既有记录无需重新写入即可读取，服务重启后仍可按 id 取回。该查询不新增或修改任何批次、记录、追加事件或幂等绑定。
+
+判定分三个阶段，错误响应只含 `{"error":"错误码"}`，不返回部分记录或内部细节，顺序固定：
+
+1. 缺少或非法的 `X-Tenant-ID`：`403 TENANT_RECORD_FORBIDDEN`，优先于一切正文判定（即使正文不是合法 JSON）。
+2. 租户有效后，正文不是合法 UTF-8 JSON 对象；或 `ids` 缺失、不是数组、项数不在 1 到 100、任一元素不是字符串或不合标识符规则、批内重复：均为 `400 invalid_request`。
+3. 参数合法后先做一次**本租户**全部 id 的存在性查询：该查询发生 SQLite 失败返回 `503 storage_error`；查询成功但任一 id 不存在即返回 `404 not_found`。其他租户密封记录中的同名 id、以及服务端加密普通记录（`records` 表）中的同名 id 都**不算**存在；因此一个不存在的 id 与一个损坏批次同时出现时，仍在检查批次详情之前确定返回 `404`。
+4. 全部 id 确认存在后，才读取所涉及批次的批次行、**该批次的全部记录与全部追加事件**；任何 SQLite 读取失败返回 `503 storage_error`。
+5. 取得全部数据后才逐批复核，口径与按批号整批读取一致：计数在 1 到 100 之间、记录与事件位置恰好覆盖 `0..count-1`、租户与"租户 + 记录 id + 位置"逐一对应，并复核全部存储字段形状。记录关联批次缺失或归属不符、记录存储的批号非法（非 `batch_` 加 32 个小写十六进制字符），或涉及批次的**任一**记录、事件不合规——包括同批中未被请求的记录损坏——整次返回 `422 integrity_error`；未涉及的其他批次即使损坏也不影响本次结果。
+
+该读取与本进程的并发密封写入、密钥轮换处于同一串行状态：要么看到写入前（该批新 id 全部 `404`）要么看到完整提交后的记录，不观察未提交批次的部分内容；密封记录不参与服务端密钥轮换。
 
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
 

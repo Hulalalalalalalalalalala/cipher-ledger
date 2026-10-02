@@ -146,6 +146,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.read_records_batch()
             elif path == "/v1/encrypted-records/batch":
                 self.ingest_encrypted_batch()
+            elif path == "/v1/encrypted-records/batch/read":
+                self.read_encrypted_records_batch()
             elif path == "/v1/keys/rotate":
                 self.rotate_keys()
             else:
@@ -254,6 +256,32 @@ class LedgerHandler(BaseHTTPRequestHandler):
             return
         items = self.server.ledger.read_batch(tenant, record_ids)
         self.send_json(200, {"items": items})
+
+    def read_encrypted_records_batch(self) -> None:
+        # Tenant resolution is an authorization decision on this sealed read,
+        # exactly as on the sealed ingress and the by-batch read: it is settled
+        # before the request body is parsed, so a missing/invalid identity
+        # always wins with 403, even over a malformed body.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        payload = self.read_json_object()
+        if payload is None:
+            self.error(400, "invalid_request")
+            return
+        record_ids = payload.get("ids")
+        if (
+            not isinstance(record_ids, list)
+            or not 1 <= len(record_ids) <= MAX_BATCH_SIZE
+            or any(not is_ident(record_id) for record_id in record_ids)
+            or len(set(record_ids)) != len(record_ids)
+        ):
+            self.error(400, "invalid_request")
+            return
+        # Extra body fields and any query string are ignored by design.
+        items = self.server.ledger.read_encrypted_records_batch(tenant, record_ids)
+        self.send_json(200, {"count": len(items), "items": items})
 
     def ingest_encrypted_batch(self) -> None:
         # Tenant resolution is an authorization decision on this ingress:
