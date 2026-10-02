@@ -127,6 +127,9 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.list_encrypted_batches(split.query)
             elif path == "/v1/encrypted-records/events":
                 self.list_encrypted_events(split.query)
+            elif path == "/v1/encrypted-records/integrity":
+                # Any query string is part of the route split but ignored.
+                self.get_encrypted_integrity()
             elif path.startswith("/v1/encrypted-records/batches/"):
                 # Any query string is part of the route split but ignored.
                 self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
@@ -603,6 +606,17 @@ class LedgerHandler(BaseHTTPRequestHandler):
             return
         # Query parameters are ignored by design; urlsplit already stripped them.
         result = self.server.ledger.read_encrypted_batch(tenant, batch_id)
+        self.send_json(200, result)
+
+    def get_encrypted_integrity(self) -> None:
+        # Tenant resolution is an authorization decision, as on every sealed
+        # entry point: a missing/invalid header fails before anything is read.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        # Query parameters are ignored by design; urlsplit already stripped them.
+        result = self.server.ledger.check_encrypted_integrity(tenant)
         self.send_json(200, result)
 
     def get_encrypted_receipt(self, key: str) -> None:

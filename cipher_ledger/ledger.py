@@ -954,6 +954,169 @@ class Ledger:
                 "created_at": batch["created_at"],
             }
 
+    # -- tenant-wide integrity inspection ------------------------------------
+
+    def check_encrypted_integrity(self, tenant: str) -> dict:
+        """Inspect every sealed batch, record, event and binding of one tenant.
+
+        The scope is the tenant's own batches plus every record, append event
+        and idempotency binding that either belongs to the tenant or points
+        directly at one of the tenant's batches -- so a cross-tenant
+        association in either direction (a foreign row referencing this
+        tenant's batch, or a tenant row referencing a missing or foreign
+        batch) is surfaced rather than overlooked. Orphan rows whose batch is
+        gone are inspected the same way.
+
+        Every needed row is fetched before any corruption verdict is made, so
+        a SQLite failure at any step is 503 rather than a 422 built on
+        partially read storage. Each batch is then reviewed with the same
+        whole-batch consistency and stored-shape rules as the by-batch read
+        (batch id format, count agreement, positions covering exactly
+        0..count-1 on both sides, tenant/record-id/position correspondence,
+        record field shapes); every in-scope event sequence must be an integer
+        in 1..2^63-1 (gaps are legitimate); every binding's key must follow
+        the identifier rules and its timestamp must be a string equal to its
+        batch's. Batches committed before idempotency existed simply have no
+        binding and are legal. The server-encrypted ``records`` table and the
+        pagination snapshots are not part of this review, and damage confined
+        to other tenants' unrelated rows cannot affect the verdict.
+
+        Read-only: nothing is written, repaired, decrypted or authenticated,
+        so equal-length ciphertext drift is not detected here either. Runs
+        under the process-wide lock, so the counts and the high-water mark
+        come from one complete serial state: a concurrent sealed commit is
+        observed either fully before or fully after, and a rolled-back commit
+        or an idempotent replay adds nothing. Returns
+        {"status", "batch_count", "record_count", "event_count",
+        "binding_count", "high_water"}; a tenant with no sealed data at all
+        gets all-zero counts and a zero high water.
+        """
+        with self._lock:
+            try:
+                batch_rows = self._connection.execute(
+                    "SELECT batch_id, tenant, record_count, created_at "
+                    "FROM encrypted_batches WHERE tenant=? ORDER BY batch_id ASC",
+                    (tenant,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            # The associated batch ids come from stored rows, so they are
+            # bound as parameters verbatim (a corrupted non-string id simply
+            # matches nothing and is rejected in the review below).
+            batch_ids = [row["batch_id"] for row in batch_rows]
+            if batch_ids:
+                placeholders = ",".join("?" * len(batch_ids))
+                scope = "WHERE tenant=? OR batch_id IN (%s)" % placeholders
+                params = (tenant, *batch_ids)
+            else:
+                scope = "WHERE tenant=?"
+                params = (tenant,)
+            try:
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, batch_id, position, algorithm, encryption_key_id, "
+                    "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records " + scope + " ORDER BY position ASC",
+                    params,
+                ).fetchall()
+                event_rows = self._connection.execute(
+                    "SELECT seq, batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events " + scope + " ORDER BY seq ASC",
+                    params,
+                ).fetchall()
+                binding_rows = self._connection.execute(
+                    "SELECT tenant, idempotency_key, batch_id, created_at "
+                    "FROM encrypted_batch_idempotency_keys " + scope,
+                    params,
+                ).fetchall()
+                max_row = self._connection.execute(
+                    "SELECT MAX(seq) FROM encrypted_record_events WHERE tenant=?",
+                    (tenant,),
+                ).fetchone()
+            except sqlite3.Error:
+                raise storage() from None
+
+            # Review phase: no storage access happens below, so every failure
+            # from here on is a 422 integrity verdict.
+            batches_by_id: dict[str, object] = {}
+            for batch in batch_rows:
+                batch_id = batch["batch_id"]
+                if (
+                    not isinstance(batch_id, str)
+                    or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None
+                ):
+                    raise integrity()
+                batches_by_id[batch_id] = batch
+
+            records_by_batch: dict[str, list] = {}
+            for row in record_rows:
+                # A foreign record pointing at this tenant's batch, or one of
+                # the tenant's own records pointing elsewhere, is a
+                # cross-tenant or dangling association.
+                if row["tenant"] != tenant:
+                    raise integrity()
+                associated = row["batch_id"]
+                if not isinstance(associated, str) or associated not in batches_by_id:
+                    raise integrity()
+                records_by_batch.setdefault(associated, []).append(row)
+
+            events_by_batch: dict[str, list] = {}
+            for event in event_rows:
+                if event["tenant"] != tenant:
+                    raise integrity()
+                seq = event["seq"]
+                if type(seq) is not int or not 1 <= seq <= MAX_EVENT_SEQ:
+                    raise integrity()
+                associated = event["batch_id"]
+                if not isinstance(associated, str) or associated not in batches_by_id:
+                    raise integrity()
+                events_by_batch.setdefault(associated, []).append(event)
+
+            for binding in binding_rows:
+                if binding["tenant"] != tenant:
+                    raise integrity()
+                key = binding["idempotency_key"]
+                if not isinstance(key, str) or ENCRYPTED_RECORD_ID.fullmatch(key) is None:
+                    raise integrity()
+                associated = binding["batch_id"]
+                if not isinstance(associated, str) or associated not in batches_by_id:
+                    raise integrity()
+                # The binding was committed in the same transaction as its
+                # batch with the same timestamp; any drift is corruption.
+                bound_at = binding["created_at"]
+                if not isinstance(bound_at, str) or bound_at != batches_by_id[associated][
+                    "created_at"
+                ]:
+                    raise integrity()
+
+            # Every batch as a whole: counts, positions, correspondence and
+            # stored record shapes, exactly as on the by-batch read.
+            for batch_id, batch in batches_by_id.items():
+                self._validate_encrypted_batch(
+                    batch,
+                    records_by_batch.get(batch_id, []),
+                    events_by_batch.get(batch_id, []),
+                )
+
+            current_max = max_row[0]
+            if current_max is None:
+                high_water = 0
+            elif type(current_max) is not int or not 0 <= current_max <= MAX_EVENT_SEQ:
+                raise integrity()
+            else:
+                high_water = current_max
+
+            # On a successful review every in-scope row belongs to the tenant,
+            # so the scoped row counts are exactly the tenant's totals.
+            return {
+                "status": "ok",
+                "batch_count": len(batch_rows),
+                "record_count": len(record_rows),
+                "event_count": len(event_rows),
+                "binding_count": len(binding_rows),
+                "high_water": high_water,
+            }
+
     def _validate_encrypted_batch(self, batch, record_rows, event_rows) -> None:
         """Cross-check batch, records and append events; raise 422 on any drift."""
         count = batch["record_count"]
