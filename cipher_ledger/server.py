@@ -146,6 +146,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.read_records_batch()
             elif path == "/v1/encrypted-records/batch":
                 self.ingest_encrypted_batch()
+            elif path == "/v1/encrypted-records/batch/read":
+                self.read_encrypted_records_batch()
             elif path == "/v1/keys/rotate":
                 self.rotate_keys()
             else:
@@ -500,6 +502,31 @@ class LedgerHandler(BaseHTTPRequestHandler):
         # Query parameters are ignored by design; urlsplit already stripped them.
         result = self.server.ledger.read_encrypted_batch(tenant, batch_id)
         self.send_json(200, result)
+
+    def read_encrypted_records_batch(self) -> None:
+        # Tenant resolution is an authorization decision, as on the other
+        # sealed-record endpoints: a missing/invalid header fails before the
+        # body is parsed, so it wins even when the JSON is malformed.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        payload = self.read_json_object()
+        if payload is None:
+            self.error(400, "invalid_request")
+            return
+        record_ids = payload.get("ids")
+        if (
+            not isinstance(record_ids, list)
+            or not 1 <= len(record_ids) <= MAX_BATCH_SIZE
+            or any(not is_ident(record_id) for record_id in record_ids)
+            or len(set(record_ids)) != len(record_ids)
+        ):
+            self.error(400, "invalid_request")
+            return
+        # Extra body fields and any query string are deliberately ignored.
+        items = self.server.ledger.read_encrypted_records_batch(tenant, record_ids)
+        self.send_json(200, {"count": len(items), "items": items})
 
     def rotate_keys(self) -> None:
         payload = self.read_json_object()

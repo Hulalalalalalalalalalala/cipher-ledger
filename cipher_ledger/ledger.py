@@ -695,36 +695,154 @@ class Ledger:
 
             self._validate_encrypted_batch(batch, record_rows, event_rows)
 
-            records: list[dict] = []
-            for row in record_rows:
-                metadata = None
-                if row["metadata"] is not None:
-                    # The JSON document was validated for shape on write; a
-                    # document that no longer parses to an object is corruption.
-                    metadata = json.loads(row["metadata"])
-                records.append(
-                    {
-                        "id": row["id"],
-                        "algorithm": row["algorithm"],
-                        "key_id": row["encryption_key_id"],
-                        "envelope": {
-                            "nonce": base64.b64encode(bytes(row["envelope_nonce"])).decode("ascii"),
-                            "wrapped_key": base64.b64encode(bytes(row["wrapped_key"])).decode("ascii"),
-                        },
-                        "ciphertext": {
-                            "data": base64.b64encode(bytes(row["ciphertext"])).decode("ascii"),
-                            "nonce": base64.b64encode(bytes(row["ciphertext_nonce"])).decode("ascii"),
-                            "tag": base64.b64encode(bytes(row["tag"])).decode("ascii"),
-                        },
-                        "metadata": metadata,
-                    }
-                )
+            records = [
+                self._serialize_encrypted_record(row) for row in record_rows
+            ]
             return {
                 "batch_id": batch["batch_id"],
                 "count": len(records),
                 "created_at": batch["created_at"],
                 "records": records,
             }
+
+    def _serialize_encrypted_record(self, row) -> dict:
+        """Render one validated sealed-record row in the public read shape."""
+        metadata = None
+        if row["metadata"] is not None:
+            # The JSON document was validated for shape on write and again on
+            # read; a document that no longer parses to an object is corruption.
+            metadata = json.loads(row["metadata"])
+        return {
+            "id": row["id"],
+            "algorithm": row["algorithm"],
+            "key_id": row["encryption_key_id"],
+            "envelope": {
+                "nonce": base64.b64encode(bytes(row["envelope_nonce"])).decode("ascii"),
+                "wrapped_key": base64.b64encode(bytes(row["wrapped_key"])).decode("ascii"),
+            },
+            "ciphertext": {
+                "data": base64.b64encode(bytes(row["ciphertext"])).decode("ascii"),
+                "nonce": base64.b64encode(bytes(row["ciphertext_nonce"])).decode("ascii"),
+                "tag": base64.b64encode(bytes(row["tag"])).decode("ascii"),
+            },
+            "metadata": metadata,
+        }
+
+    def read_encrypted_records_batch(
+        self, tenant: str, record_ids: list[str]
+    ) -> list[dict]:
+        """Fetch sealed records of one tenant by id, possibly across batches.
+
+        Existence is settled first in a single tenant-scoped query: only the
+        client-sealed ``encrypted_records`` table counts, so a plain
+        server-encrypted ``records`` row or another tenant's same-named id
+        counts as missing. Any missing id fails the whole request with 404
+        before any batch detail is read, so a request mixing a missing id with
+        a damaged batch deterministically returns 404.
+
+        Only once every id is known to exist are the involved batches, their
+        full record sets and their append events loaded; any read failure is
+        503. Every involved batch then passes the exact whole-batch review used
+        by the single-batch read -- counts, positions, tenant/event
+        correspondence and stored field shapes -- including records that share
+        a batch but were not requested. A batch unrelated to any requested id
+        is never inspected. Items come back strictly in request order, each
+        carrying its batch id and that batch's verbatim ``created_at``.
+
+        Envelopes are never opened and ciphertext authentication is never
+        evaluated. Read-only; runs under the process-wide lock, so it observes
+        one complete serial state relative to concurrent writes and rotations.
+        """
+        with self._lock:
+            # Phase 1: tenant-scoped existence over sealed record ids only.
+            try:
+                rows = self._connection.execute(
+                    "SELECT id, batch_id FROM encrypted_records "
+                    "WHERE tenant=? AND id IN (%s)"
+                    % ",".join("?" * len(record_ids)),
+                    (tenant, *record_ids),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            batch_by_id = {row["id"]: row["batch_id"] for row in rows}
+            if any(record_id not in batch_by_id for record_id in record_ids):
+                raise not_found()
+
+            # Phase 2: load every involved batch with its complete record and
+            # event sets; storage failure here precedes the integrity review.
+            batch_ids: list[str] = []
+            seen_batches: set[str] = set()
+            for record_id in record_ids:
+                batch_id = batch_by_id[record_id]
+                if batch_id not in seen_batches:
+                    seen_batches.add(batch_id)
+                    batch_ids.append(batch_id)
+
+            batches: dict[str, object] = {}
+            record_rows_by_batch: dict[str, list[object]] = {}
+            events_by_batch: dict[str, list[object]] = {}
+            try:
+                for batch_id in batch_ids:
+                    batch = self._connection.execute(
+                        "SELECT batch_id, tenant, record_count, created_at "
+                        "FROM encrypted_batches WHERE batch_id=?",
+                        (batch_id,),
+                    ).fetchone()
+                    record_rows = self._connection.execute(
+                        "SELECT tenant, id, batch_id, position, algorithm, "
+                        "encryption_key_id, envelope_nonce, wrapped_key, ciphertext, "
+                        "ciphertext_nonce, tag, metadata "
+                        "FROM encrypted_records WHERE batch_id=? ORDER BY position ASC",
+                        (batch_id,),
+                    ).fetchall()
+                    event_rows = self._connection.execute(
+                        "SELECT batch_id, tenant, record_id, position "
+                        "FROM encrypted_record_events WHERE batch_id=? ORDER BY seq ASC",
+                        (batch_id,),
+                    ).fetchall()
+                    batches[batch_id] = batch
+                    record_rows_by_batch[batch_id] = record_rows
+                    events_by_batch[batch_id] = event_rows
+            except sqlite3.Error:
+                raise storage() from None
+
+            # Phase 3: only after all data is in hand, review each involved
+            # batch as a whole. A requested record whose batch row vanished
+            # between the two queries, a malformed batch id stored on the link,
+            # an ownership mismatch, or any record/event drift or shape problem
+            # in the batch (even on an unrequested sibling record) is 422.
+            records_by_id: dict[str, object] = {}
+            for batch_id in batch_ids:
+                batch = batches[batch_id]
+                record_rows = record_rows_by_batch[batch_id]
+                event_rows = events_by_batch[batch_id]
+                if (
+                    batch is None
+                    or not isinstance(batch["batch_id"], str)
+                    or ENCRYPTED_BATCH_ID.fullmatch(batch["batch_id"]) is None
+                ):
+                    raise integrity()
+                # The batch a requested record links to must be owned by the
+                # requesting tenant; a cross-tenant link is attribution drift.
+                if batch["tenant"] != tenant:
+                    raise integrity()
+                self._validate_encrypted_batch(batch, record_rows, event_rows)
+                for row in record_rows:
+                    records_by_id[(batch_id, row["id"])] = row
+
+            items: list[dict] = []
+            for record_id in record_ids:
+                batch_id = batch_by_id[record_id]
+                row = records_by_id.get((batch_id, record_id))
+                # The link found in phase 1 must still resolve to the caller's
+                # record in the reviewed batch; anything else is drift.
+                if row is None or row["tenant"] != tenant:
+                    raise integrity()
+                item = self._serialize_encrypted_record(row)
+                item["batch_id"] = batch_id
+                item["created_at"] = batches[batch_id]["created_at"]
+                items.append(item)
+            return items
 
     def _validate_encrypted_batch(self, batch, record_rows, event_rows) -> None:
         """Cross-check batch, records and append events; raise 422 on any drift."""

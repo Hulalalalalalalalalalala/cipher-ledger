@@ -38,6 +38,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `POST /v1/records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}` | `200 {"items":[{"id":"invoice_1","plaintext":"...","key_version":1}, ...]}` |
 | `POST /v1/encrypted-records/batch` | 租户头；可选 `Idempotency-Key` 头；调用方已密封的记录集合（见下） | 新键 `201 {"batch_id":"batch_…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...]}`；同键同内容重放 `200`，正文与首次成功一致 |
 | `GET /v1/encrypted-records/batches/{batch_id}` | 租户头；批号为 `batch_` 加 32 个小写十六进制字符；查询参数忽略 | `200 {"batch_id":"…","count":2,"created_at":"…","records":[...]}`（见下） |
+| `POST /v1/encrypted-records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}` | `200 {"count":2,"items":[{"id":"invoice_1","batch_id":"…","created_at":"…", ...}, ...]}`（见下） |
 | `GET /v1/encrypted-records/batches` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"batch_id":"…","count":2,"created_at":"…"}, ...],"next_cursor":"..."}`（见下） |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
@@ -180,6 +181,52 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 5. 读取过程中 SQLite 失败：`503 storage_error`。
 
 该读取与本进程的并发密封写入、密钥轮换处于同一串行状态：要么看到写入前（404）要么看到完整提交后的整批，不能看到未提交批次的部分内容。密封记录不参与服务端密钥轮换，原有记录写入、读取、快照分页、健康检查与密钥管理的语义保持不变；日志不记录信封内容或密钥。
+
+### 按记录 id 跨批次取回密封记录 `POST /v1/encrypted-records/batch/read`
+
+该入口只读地按记录 id 取回当前租户的客户端密封记录，请求的记录可来自不同批次。请求头必须带合法的 `X-Tenant-ID`；请求体是一个对象，`ids` 为 1 到 100 项的有序数组，每个 id 符合标识符规则且批内不得重复。成功返回 `200`：
+
+```json
+{
+  "count": 2,
+  "items": [
+    {
+      "id": "invoice_2",
+      "batch_id": "batch_1a2b3c4d5e6f70819203a4b5c6d7e8f0",
+      "created_at": "2026-10-02T09:30:00+00:00",
+      "algorithm": "AES-256-GCM",
+      "key_id": "client-key-1",
+      "envelope": {"nonce": "<base64 12 字节>", "wrapped_key": "<base64 48 字节>"},
+      "ciphertext": {"data": "<base64 密文正文>", "nonce": "<base64 12 字节>", "tag": "<base64 16 字节>"},
+      "metadata": {"order": "A-100"}
+    },
+    {
+      "id": "invoice_1",
+      "batch_id": "batch_0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "created_at": "2026-10-02T08:30:00+00:00",
+      "algorithm": "AES-256-GCM",
+      "key_id": null,
+      "envelope": {"nonce": "<base64 12 字节>", "wrapped_key": "<base64 48 字节>"},
+      "ciphertext": {"data": "", "nonce": "<base64 12 字节>", "tag": "<base64 16 字节>"},
+      "metadata": null
+    }
+  ]
+}
+```
+
+- `count` 等于请求 id 数；`items` 严格按请求顺序逐项给出，只返回请求的记录。每条记录在按批号整批读取的记录结构上增加 `batch_id` 与 `created_at`：前者是该记录所属批次，后者是该批次提交时存库的字符串，原样返回。同一批次的多个 id 共用同一 `batch_id`/`created_at`。
+- Base64（标准含填充）、空密文 `data` 为空串、省略的 `key_id`/`metadata` 返回 `null`、`metadata` 恢复为 JSON 对象等口径与整批读取完全一致。请求体未列明字段与查询参数一律忽略。
+- 先做一次本租户全部 id 的存在性查询：只计 `encrypted_records` 表中的同租户行，其他租户的同名 id 以及服务端加密普通记录 `records` 中的同名 id 都不算存在。任一 id 缺失即 `404 not_found`，因此缺失 id 与损坏批次同时出现仍确定返回 404。全部 id 存在后才读取涉及批次的批次行、该批次完整记录集（含同批未请求记录）与全部追加事件；任何 SQLite 读取失败返回 `503 storage_error`。取得全部数据后才复核完整性。
+- 完整性复核沿用整批读取的计数、位置、租户、事件对应关系与字段形状限制：记录关联批次缺失、批号非法或归属不符，或任一涉及批次的记录、事件不合规（包括同批未请求记录损坏），整次返回 `422 integrity_error`；无关批次损坏不影响结果。服务不解密也不认证客户端密文，等长字节改动仍原样返回。读取不写入任何数据，旧记录重启后仍可读。
+
+错误响应只含 `{"error":"错误码"}`，不含部分条目或内部细节，判定顺序固定：
+
+1. 缺少或非法的 `X-Tenant-ID`：`403 TENANT_RECORD_FORBIDDEN`，优先于正文判定（即使正文不是合法 UTF-8 JSON）。
+2. 租户有效但正文不是合法 UTF-8 JSON 对象，或 `ids` 缺失、不是数组、项数不在 1 到 100、元素不是合规则标识符字符串、批内重复：`400 invalid_request`。
+3. 存在性查询发生 SQLite 失败：`503 storage_error`；查询成功但任一 id 不存在：`404 not_found`。
+4. 读取涉及批次数据发生 SQLite 失败：`503 storage_error`；全部数据取得后完整性复核未通过：`422 integrity_error`。
+
+该读取与同进程的并发密封写入、密钥轮换等价于一个完整串行时刻，只能看到提交前（404）或完整提交后的记录，不观察部分提交；密封记录不参与服务端密钥轮换。
 
 ### 查询租户批次清单 `GET /v1/encrypted-records/batches`
 
