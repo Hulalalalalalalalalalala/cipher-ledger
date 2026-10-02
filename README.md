@@ -41,6 +41,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `GET /v1/encrypted-records/batches` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"batch_id":"…","count":2,"created_at":"…"}, ...],"next_cursor":"..."}`（见下） |
 | `GET /v1/encrypted-records/events` | 租户头；首次查询参数 `after_seq`（省略为 0）、`limit`；续页参数 `cursor`、可选 `limit` | `200 {"items":[{"seq":…,"batch_id":"…","id":"…","position":…,"created_at":"…"}, ...],"high_water":…,"next_cursor":"..."}`（见下） |
 | `POST /v1/encrypted-records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}`（1 到 100 个不重复 id）；查询参数与未列明字段忽略 | `200 {"count":2,"items":[...]}`（见下，按输入顺序跨批次返回） |
+| `GET /v1/encrypted-records/receipts/{key}` | 租户头；键沿用 `Idempotency-Key` 的格式与大小写规则；查询参数忽略 | `200 {"batch_id":"…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...],"created_at":"…"}`（见下） |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
@@ -274,6 +275,36 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 5. 取得全部数据后才逐批复核，口径与按批号整批读取一致：计数在 1 到 100 之间、记录与事件位置恰好覆盖 `0..count-1`、租户与"租户 + 记录 id + 位置"逐一对应，并复核全部存储字段形状。记录关联批次缺失或归属不符、记录存储的批号非法（非 `batch_` 加 32 个小写十六进制字符），或涉及批次的**任一**记录、事件不合规——包括同批中未被请求的记录损坏——整次返回 `422 integrity_error`；未涉及的其他批次即使损坏也不影响本次结果。
 
 该读取与本进程的并发密封写入、密钥轮换处于同一串行状态：要么看到写入前（该批新 id 全部 `404`）要么看到完整提交后的记录，不观察未提交批次的部分内容；密封记录不参与服务端密钥轮换。
+
+### 按幂等键查询提交凭据 `GET /v1/encrypted-records/receipts/{key}`
+
+该入口只读地按 `Idempotency-Key` 查询一次成功密封批量写入的提交凭据，调用方无需重传密文即可确认写入结果。请求头必须带合法的 `X-Tenant-ID`；路径中的键精确沿用 `Idempotency-Key` 的格式与大小写规则（`[A-Za-z0-9_-]{1,64}`，区分大小写），查询参数一律忽略。成功返回 `200`：
+
+```json
+{
+  "batch_id": "batch_0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+  "count": 2,
+  "results": [
+    {"id": "invoice_1", "status": "created"},
+    {"id": "invoice_2", "status": "created"}
+  ],
+  "created_at": "2026-10-02T08:30:00+00:00"
+}
+```
+
+- `batch_id`、`count`、`results` 与该键首次写入成功的 `201` 响应一致：`results` 严格按原提交顺序逐条给出 `id` 与 `status: "created"`；`created_at` 原样取自关联批次行。
+- 绑定按租户隔离：既有成功绑定无需重写即可查询，服务重启与密钥轮换后凭据保持一致；未携带幂等键写入的旧批次没有绑定，任何键都查不到它们。
+- 该查询不新增、修改或修复任何存储内容，不解密信封；响应与日志不包含密文、信封或密钥内容。未被该键关联的批次即使损坏也不影响本次结果。
+
+判定顺序固定，错误响应只含 `{"error":"错误码"}`，不返回部分凭据：
+
+1. 缺少或非法的 `X-Tenant-ID`：`403 TENANT_RECORD_FORBIDDEN`，优先于键格式判定。
+2. 租户合法但键为空或不合规则：`400 invalid_request`。
+3. 本租户下无此键的绑定：`404 not_found`，即使其他租户绑定了同名键也一样。
+4. 绑定存在后：关联批次缺失、归属其他租户、批号非法（非 `batch_` 加 32 个小写十六进制字符），或绑定时间不是字符串、与批次时间不同，均为 `422 integrity_error`；返回前还按既有整批读取口径复核关联批次的全部记录与追加事件，计数、位置、租户与 id 对应关系或任一字段形状不合规同样返回 `422 integrity_error`。
+5. 任一步 SQLite 读取失败：`503 storage_error`；所需数据库读取全部成功后才判定损坏。
+
+该查询与本进程的并发密封写入处于同一串行状态：同键提交期间只会得到未绑定的 `404` 或完整成功凭据，新键提交失败回滚后仍为 `404`，幂等重放不改变凭据。既有单记录接口、两类批量写入、全部读取与分页、增量事件、健康检查及密钥管理的公开行为保持不变。
 
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
 

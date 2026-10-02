@@ -130,6 +130,9 @@ class LedgerHandler(BaseHTTPRequestHandler):
             elif path.startswith("/v1/encrypted-records/batches/"):
                 # Any query string is part of the route split but ignored.
                 self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
+            elif path.startswith("/v1/encrypted-records/receipts/"):
+                # Any query string is part of the route split but ignored.
+                self.get_encrypted_receipt(path[len("/v1/encrypted-records/receipts/") :])
             else:
                 self.error(404, "not_found")
         except LedgerError as exc:
@@ -600,6 +603,22 @@ class LedgerHandler(BaseHTTPRequestHandler):
             return
         # Query parameters are ignored by design; urlsplit already stripped them.
         result = self.server.ledger.read_encrypted_batch(tenant, batch_id)
+        self.send_json(200, result)
+
+    def get_encrypted_receipt(self, key: str) -> None:
+        # Tenant resolution is an authorization decision, as on the sealed
+        # ingress: a missing/invalid header fails before the key is read.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        # The key follows the Idempotency-Key format and case rules; a
+        # well-formed tenant but empty/malformed key is a plain bad request.
+        if not is_ident(key):
+            self.error(400, "invalid_request")
+            return
+        # Query parameters are ignored by design; urlsplit already stripped them.
+        result = self.server.ledger.read_encrypted_receipt(tenant, key)
         self.send_json(200, result)
 
     def rotate_keys(self) -> None:

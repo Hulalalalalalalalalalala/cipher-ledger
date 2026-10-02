@@ -864,6 +864,96 @@ class Ledger:
                 items.append(item)
             return items
 
+    # -- idempotency receipts ------------------------------------------------
+
+    def read_encrypted_receipt(self, tenant: str, idempotency_key: str) -> dict:
+        """Return the commit receipt bound to one idempotency key, read-only.
+
+        The binding lookup is tenant-scoped, so a key bound only by another
+        tenant is indistinguishable from an unbound key (404). Once a binding
+        is found, the associated batch id's own shape, the batch row's
+        existence and ownership, and the agreement between the binding's
+        ``created_at`` and the batch's are all part of the integrity review
+        (422), exactly like a dangling or repointed association on the other
+        sealed reads. The associated batch is then re-validated whole -- every
+        record and append event, counts, positions, tenant correspondence and
+        stored field shapes -- with the same review as the by-batch read, so a
+        receipt is only ever returned alongside a fully consistent batch.
+
+        Every needed row (binding, batch, records, events) is fetched before
+        any corruption verdict is made, so a SQLite failure at any step is 503
+        rather than a 422 built on partially read storage. Corruption in
+        batches the binding does not point at is never loaded and cannot
+        affect the result. Envelopes are never opened. Runs under the
+        process-wide lock, so a concurrent same-key commit is observed either
+        before binding (404) or as one complete committed batch; a rolled-back
+        commit leaves the key unbound. Returns
+        {"batch_id", "count", "results", "created_at"} -- no ciphertext,
+        envelope or key material.
+        """
+        with self._lock:
+            try:
+                binding = self._connection.execute(
+                    "SELECT tenant, idempotency_key, batch_id, created_at "
+                    "FROM encrypted_batch_idempotency_keys "
+                    "WHERE tenant=? AND idempotency_key=?",
+                    (tenant, idempotency_key),
+                ).fetchone()
+            except sqlite3.Error:
+                raise storage() from None
+            if binding is None:
+                raise not_found()
+
+            batch_id = binding["batch_id"]
+            try:
+                batch = self._connection.execute(
+                    "SELECT batch_id, tenant, record_count, created_at "
+                    "FROM encrypted_batches WHERE batch_id=?",
+                    (batch_id,),
+                ).fetchone()
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, batch_id, position, algorithm, encryption_key_id, "
+                    "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records WHERE batch_id=? ORDER BY position ASC",
+                    (batch_id,),
+                ).fetchall()
+                event_rows = self._connection.execute(
+                    "SELECT batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events WHERE batch_id=? ORDER BY seq ASC",
+                    (batch_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            # The associated batch id comes from a stored row, not a
+            # path-validated URL, so its shape is itself part of the review.
+            if (
+                not isinstance(batch_id, str)
+                or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None
+            ):
+                raise integrity()
+            # A dangling association (missing batch row) or one repointed at
+            # another tenant's batch is a relationship failure, not a 404:
+            # the binding itself exists for this tenant.
+            if batch is None or batch["tenant"] != tenant:
+                raise integrity()
+            # The binding was committed in the same transaction as the batch
+            # with the same timestamp; any drift between them is corruption.
+            bound_at = binding["created_at"]
+            if not isinstance(bound_at, str) or bound_at != batch["created_at"]:
+                raise integrity()
+
+            self._validate_encrypted_batch(batch, record_rows, event_rows)
+
+            return {
+                "batch_id": batch["batch_id"],
+                "count": len(record_rows),
+                "results": [
+                    {"id": row["id"], "status": "created"} for row in record_rows
+                ],
+                "created_at": batch["created_at"],
+            }
+
     def _validate_encrypted_batch(self, batch, record_rows, event_rows) -> None:
         """Cross-check batch, records and append events; raise 422 on any drift."""
         count = batch["record_count"]
