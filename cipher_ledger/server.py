@@ -20,6 +20,7 @@ MAX_ENCRYPTION_KEY_ID = 128
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 100
 TENANT_HEADER = "X-Tenant-ID"
+IDEMPOTENCY_HEADER = "Idempotency-Key"
 
 # Algorithms accepted on the encrypted ingress. Each pins the exact byte
 # lengths the service validates and stores, so an unsupported value or a body
@@ -290,6 +291,7 @@ class LedgerHandler(BaseHTTPRequestHandler):
                     )
                     return
 
+
         # Pass 2: validate and decode every record before the ledger is
         # touched. Any failure aborts the whole batch and names its location.
         entries: list[EncryptedEntry] = []
@@ -413,9 +415,32 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 )
             )
 
-        batch_id, record_ids = self.server.ledger.ingest_encrypted_batch(tenant, entries)
+        # The optional idempotency header is evaluated only once the request
+        # has passed the existing shape validation and both 403 rules
+        # (identity at the top, cross-tenant claims in pass 1), so those keep
+        # their established precedence. Omitting the header preserves the
+        # legacy write path; a duplicated, empty or syntactically invalid
+        # header is an INVALID_BATCH whose message names the header itself.
+        idempotency_key: str | None = None
+        header_values = self.headers.get_all(IDEMPOTENCY_HEADER)
+        if header_values is not None:
+            if len(header_values) != 1 or not is_ident(header_values[0]):
+                self.error(
+                    400,
+                    "INVALID_BATCH",
+                    f"{IDEMPOTENCY_HEADER} header must occur once and match "
+                    "[A-Za-z0-9_-]{1,64}",
+                )
+                return
+            idempotency_key = header_values[0]
+
+        batch_id, record_ids, replayed = self.server.ledger.ingest_encrypted_batch(
+            tenant, entries, idempotency_key
+        )
+        # A first success keeps the legacy 201; a same-key/same-content retry
+        # replays the original response body with 200 and creates nothing.
         self.send_json(
-            201,
+            200 if replayed else 201,
             {
                 "batch_id": batch_id,
                 "count": len(record_ids),

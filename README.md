@@ -36,7 +36,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `GET /v1/records` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"id":"invoice_1"}, ...],"next_cursor":"..."}` |
 | `GET /v1/records/invoice_1` | 租户头 | `200 {"id":"invoice_1","plaintext":"待保存文字","key_version":1}` |
 | `POST /v1/records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}` | `200 {"items":[{"id":"invoice_1","plaintext":"...","key_version":1}, ...]}` |
-| `POST /v1/encrypted-records/batch` | 租户头；调用方已密封的记录集合（见下） | `201 {"batch_id":"batch_…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...]}` |
+| `POST /v1/encrypted-records/batch` | 租户头；可选 `Idempotency-Key` 头；调用方已密封的记录集合（见下） | 新键 `201 {"batch_id":"batch_…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...]}`；同键同内容重放 `200`，正文与首次成功一致 |
 | `GET /v1/encrypted-records/batches/{batch_id}` | 租户头；批号为 `batch_` 加 32 个小写十六进制字符；查询参数忽略 | `200 {"batch_id":"…","count":2,"created_at":"…","records":[...]}`（见下） |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
@@ -85,6 +85,12 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 - `metadata`：可选关联元数据，必须是 JSON 对象，紧凑 UTF-8 序列化后不超过 16384 字节，原样存储；省略时按 null 存储。
 - 每项可带 `tenant` 字段，但取值必须与请求头租户一致；属于其他租户见 403 口径。未列明的其他字段忽略。
 
+请求头可选带 `Idempotency-Key`，用于在响应丢失后安全重试：
+
+- 取值精确匹配 `[A-Za-z0-9_-]{1,64}`，区分大小写，按租户隔离。不带该头时完全保持既有写入行为。
+- 关联只在请求通过既有形状校验与批内重复 id 校验后才判定，且先于“该租户下 id 已存在”的检查。空值、非法值或该头重复出现，均返回 `400 INVALID_BATCH`，`message` 指向 `Idempotency-Key` 请求头；租户身份缺失/非法与跨租户声明仍沿用既有 `403` 优先规则。
+- 绑定一旦成功建立不自动过期，服务重启后仍有效。旧数据库可直接启动，既有批次无需补键。
+
 成功返回 `201`：
 
 ```json
@@ -100,9 +106,11 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 
 `batch_id` 是本次提交的批次标识（`batch_` 加 32 个十六进制字符）；`count` 为成功记录总数；`results` 严格按输入顺序逐条给出记录标识与写入结果 `created`，调用方可据此逐条确认。
 
+携带新 `Idempotency-Key` 的首次成功返回上述 `201` 正文。同租户同键、且内容与首次成功提交一致的重试返回 `200`，响应正文与首次成功完全相同——`batch_id`、`count` 与有序 `results` 均不变，且不新增批次、记录或追加事件。内容一致性按**实际保存字段**比较：逐条记录及数组顺序都参与比较；对象键顺序、JSON 排版空白以及未保存（忽略）字段不影响结果；字节字段比较 Base64 解码后的字节值（标准含填充编码）；`key_id` 与 `metadata` 的省略与显式 `null` 等价；`metadata` 数字按数值比较（`1` 与 `1.0` 相等），但布尔值与数字不同（`true` 不等于 `1`）。
+
 #### 确定的错误结果
 
-错误响应形状为 `{"error":"错误码","message":"具体说明"}`，`message` 用点路径指向具体输入位置（如 `records[2].envelope.nonce`）。三类结果是确定且互斥的：
+错误响应形状为 `{"error":"错误码","message":"具体说明"}`，`message` 用点路径指向具体输入位置（如 `records[2].envelope.nonce`）。结果是确定且互斥的：
 
 - `400 {"error":"INVALID_BATCH", ...}`：整批先校验、后写入，只要出现下列任一情况，整批都不提交，且不区分成多个模糊错误码——批内重复 id 与既有记录冲突同样返回本结果：
   - 请求体不是 JSON 对象；`records` 缺失、不是数组、为空或超过 100 项；
@@ -110,14 +118,21 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
   - `envelope` 或 `ciphertext` 缺失、不是对象，或其中必需的 `nonce`/`wrapped_key`/`data`/`tag` 缺失、不是合法 Base64；
   - `algorithm` 缺失或不受支持；字段与算法互相矛盾（如 `AES-128-GCM` 却给 48 字节 `wrapped_key`），或 nonce/tag/wrapped_key 长度不符、`data` 超限；
   - `metadata` 非对象或超限；`key_id` 类型或长度非法；
-  - 同一批次内重复使用同一记录标识；该租户下已存在相同 `id` 的记录。
+  - 同一批次内重复使用同一记录标识；该租户下已存在相同 `id` 的记录（携带**新**幂等键时亦然，且该键不会被绑定）；
+  - `Idempotency-Key` 头为空、取值不合法，或该头重复出现——`message` 指向该请求头。
   - 校验在触碰数据库之前完成，返回第一个非法位置，此时新记录不可见。
-- `403 {"error":"TENANT_RECORD_FORBIDDEN", ...}`：请求身份无法确定租户（缺少或非法的 `X-Tenant-ID`），或任一记录属于/声称为其他租户、试图跨租户覆盖。跨租户绑定判定先于形状校验，因此即使该记录其他字段也不合法，只要声明了其他租户即返回 403。不同租户使用相同 `id` 彼此独立、互不可读、互不可覆盖。
-- `500 {"error":"BATCH_WRITE_FAILED"}`：整批通过校验后，在数据库约束、账本追加或提交阶段发生任何失败。整批回滚：已有记录保持原值，批次行、记录与追加事件都不可见，不留部分数据。该响应不含其他细节。
+- `403 {"error":"TENANT_RECORD_FORBIDDEN", ...}`：请求身份无法确定租户（缺少或非法的 `X-Tenant-ID`），或任一记录属于/声称为其他租户、试图跨租户覆盖。跨租户绑定判定先于形状与幂等头校验，因此即使该记录其他字段也不合法，只要声明了其他租户即返回 403。不同租户使用相同 `id`（及相同幂等键）彼此独立、互不可读、互不可覆盖。
+- 携带幂等键且该键已绑定时，在既有 id 冲突检查**之前**判定：内容一致 → `200` 重放（见上）；内容不一致 → `409 {"error":"IDEMPOTENCY_CONFLICT"}`，即使重试中的 `id` 也已存在，仍以 409 为准；绑定指向的批次缺失、被错绑到其他租户，或不满足下文“整批一致性复核”，返回 `422 {"error":"integrity_error"}`。
+- `500 {"error":"BATCH_WRITE_FAILED"}`：整批通过校验后，在幂等查询/提交、数据库约束、账本追加或提交阶段发生任何 SQLite 失败。整批回滚：已有记录与已有关联保持原值，批次行、记录、追加事件与新键绑定都不可见，不留部分数据；新键未被占用，故障恢复后同键可直接重试。该响应不含其他细节。
 
 #### 原子性与幂等/重试口径
 
-整批记录在同一次原子提交中落库（批次行、每条记录、每条追加事件同一事务）。失败请求绝不留下部分数据。记录标识与所属租户在服务端与加密内容绑定存储；主键为 `(tenant, id)`，因此同一租户同一 `id` 已存在时整批 `INVALID_BATCH`，不会覆盖。对同一批记录的异步/超时重试：第一次已成功提交后，重试会因这些 `id` 已存在而确定得到 `400 INVALID_BATCH`，不会产生重复行；调用方应以记录标识为准去重，或在重试前改用新的标识。并发提交同一组 `(tenant, id)` 时只有一个请求 `201`，其余确定失败且一条都不落库。
+整批记录在同一次原子提交中落库（批次行、每条记录、每条追加事件，以及携带幂等键时的幂等关联，同一事务）。失败请求绝不留下部分数据，也不会占用一个新键；恢复后同键可重试。记录标识与所属租户在服务端与加密内容绑定存储；主键为 `(tenant, id)`，因此同一租户同一 `id` 已存在时整批 `INVALID_BATCH`，不会覆盖。重试口径分两种：
+
+- 不带 `Idempotency-Key`：第一次已成功提交后，重试会因这些 `id` 已存在而确定得到 `400 INVALID_BATCH`，不会产生重复行；调用方应以记录标识为准去重，或在重试前改用新的标识。
+- 携带 `Idempotency-Key`：同租户同键同内容的重试确定返回 `200` 与首次成功正文，不新增批次、记录或事件；同键不同内容确定返回 `409 IDEMPOTENCY_CONFLICT`。绑定按租户隔离、区分大小写、不自动过期，重启后仍有效。
+
+并发提交同一组 `(tenant, id)`（均不带幂等键）时只有一个请求 `201`，其余确定失败且一条都不落库。并发携带同一幂等键时：同内容只有一次 `201`，其余返回 `200` 且指向同一批次；不同内容只有成功提交者占用该键，其余返回 `409`。
 
 服务端不校验也不解密客户端信封的密码学正确性，只校验算法名与字节形状并原样存储；调用方需自行保证数据密钥封装、正文 AEAD 与所需的上下文绑定，以便日后用相同格式离线恢复。
 
@@ -185,7 +200,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 
 AAD 是 UTF-8 编码的无多余空白 JSON 数组。正文 AAD 为 `[1,"租户","记录id"]`，封装 AAD 为 `[1,"租户","记录id",密钥版本]`。数字 1 表示信封格式版本。标识符均为上述 ASCII 字符，因此不涉及字符串转义差异。这样导出的信封可用相同公开格式恢复。数据库中移植整组密文字段到其他租户或 id，或改变版本、nonce、密文和封装，应在读取时被拒绝；不能仅依靠查询过滤代替密码学绑定。
 
-客户端密封批量入口使用三张独立的表，均在同一次事务中写入：`encrypted_batches(batch_id, tenant, record_count, created_at)` 记录每个成功批次；`encrypted_records(tenant, id, batch_id, position, algorithm, encryption_key_id, envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata)` 以 `(tenant, id)` 为主键原样保存调用方提交的字节，与服务端加密的 `records` 表互不影响；`encrypted_record_events(seq, batch_id, tenant, record_id, position)` 是仅追加的账本，`seq` 单调递增，每条新可见记录对应一行。批次任一步骤失败时三张表一起回滚，因此不会出现有记录无事件、或有批次无记录的中间状态。该入口的信封不参与服务端密钥轮换（服务端不持有其封装密钥）。
+客户端密封批量入口使用四张独立的表，均在同一次事务中写入：`encrypted_batches(batch_id, tenant, record_count, created_at)` 记录每个成功批次；`encrypted_records(tenant, id, batch_id, position, algorithm, encryption_key_id, envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata)` 以 `(tenant, id)` 为主键原样保存调用方提交的字节，与服务端加密的 `records` 表互不影响；`encrypted_record_events(seq, batch_id, tenant, record_id, position)` 是仅追加的账本，`seq` 单调递增，每条新可见记录对应一行；`encrypted_batch_idempotency_keys(tenant, idempotency_key, batch_id, created_at)` 以 `(tenant, idempotency_key)` 为主键记录幂等关联，仅在携带 `Idempotency-Key` 成功提交时与该批次同事务写入，旧批次没有对应行。批次任一步骤失败时这些表一起回滚，因此不会出现有记录无事件、有批次无记录，或有幂等关联却无完整批次的中间状态。该入口的信封不参与服务端密钥轮换（服务端不持有其封装密钥）。
 
 ## 轮换和并发边界
 

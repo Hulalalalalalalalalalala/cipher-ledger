@@ -82,6 +82,19 @@ def initialize(database: str | Path, initial_version: int | None = None) -> None
                 "record_id TEXT NOT NULL, "
                 "position INTEGER NOT NULL)"
             )
+            # Idempotency bindings for the sealed batch ingress. A key is
+            # inserted in the same transaction as the batch it points to, so a
+            # row here exists only for a fully committed batch. The binding is
+            # tenant scoped, never expires and survives restarts; batches
+            # written before this table existed simply have no row.
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS encrypted_batch_idempotency_keys ("
+                "tenant TEXT NOT NULL, "
+                "idempotency_key TEXT NOT NULL, "
+                "batch_id TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "PRIMARY KEY (tenant, idempotency_key))"
+            )
             if initial_version is not None:
                 connection.execute(
                     "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",
