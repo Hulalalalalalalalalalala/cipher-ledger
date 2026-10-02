@@ -127,6 +127,9 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.list_encrypted_batches(split.query)
             elif path == "/v1/encrypted-records/events":
                 self.list_encrypted_events(split.query)
+            elif path == "/v1/encrypted-records/integrity":
+                # The integrity inspection ignores every query parameter.
+                self.encrypted_integrity()
             elif path.startswith("/v1/encrypted-records/batches/"):
                 # Any query string is part of the route split but ignored.
                 self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
@@ -590,6 +593,18 @@ class LedgerHandler(BaseHTTPRequestHandler):
         if next_cursor is not None:
             body["next_cursor"] = next_cursor
         self.send_json(200, body)
+
+    def encrypted_integrity(self) -> None:
+        # Tenant resolution is an authorization decision on this read-only
+        # inspection, exactly as on every other sealed-record entry point: a
+        # missing/invalid header fails before any storage is touched, even
+        # though every query parameter is ignored.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        report = self.server.ledger.encrypted_integrity_report(tenant)
+        self.send_json(200, report)
 
     def get_encrypted_batch(self, batch_id: str) -> None:        # Tenant resolution is an authorization decision, as on the sealed
         # ingress: a missing/invalid header fails before the batch id is read.

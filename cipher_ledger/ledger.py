@@ -954,6 +954,179 @@ class Ledger:
                 "created_at": batch["created_at"],
             }
 
+    # -- tenant-wide integrity inspection ------------------------------------
+
+    def encrypted_integrity_report(self, tenant: str) -> dict:
+        """Review every sealed artifact visible to one tenant, read-only.
+
+        The scope is this tenant's sealed batches plus every record, append
+        event and idempotency binding that points at any of them -- including
+        rows keyed by another tenant. A row that points at this tenant's batch
+        is part of this tenant's review even when its own stored tenant differs,
+        so such a cross-tenant association always fails it. A batch, record,
+        event or binding with no in-scope relationship is irrelevant, exactly as
+        on the other sealed reads: other tenants' intact or damaged data and
+        the ordinary server-encrypted ``records`` table never enter the result.
+
+        Read phase first: all rows are fetched before any verdict is made, so a
+        SQLite failure anywhere here is 503 rather than a 422 built on
+        partially read storage. Validation phase next: every in-scope batch
+        passes the same whole-batch review as the by-batch read, every event's
+        sequence is a signed 64-bit positive integer (gaps allowed), and every
+        binding's key, timestamp and link are checked -- a binding is legal
+        only when it belongs to this tenant, its key matches the identifier
+        rule, its batch exists and is this tenant's, and its string timestamp
+        equals the batch timestamp. Historical batches without a binding are
+        legitimate.
+
+        Only after everything validates are the four totals and the high water
+        mark projected from the same rows: counts of this tenant's batches,
+        records and events, the number of bindings pointing at this tenant's
+        batches, and the tenant's largest event sequence (0 with no events).
+        Runs under the process-wide lock, so the numbers are one complete
+        serial state: a concurrent commit is observed either not at all or in
+        full, and a rolled-back commit or an idempotent replay adds nothing.
+        Envelopes are never opened; the response carries no ciphertext.
+        """
+        with self._lock:
+            # Read phase: fetch every protocol row that can participate in this
+            # tenant's review before judging any of them, so storage failures
+            # always take precedence over corruption verdicts. Scope is the
+            # tenant's own rows *plus* anything linked to one of this tenant's
+            # batches: an own row dangling at a missing/foreign batch is an
+            # orphan, and a foreign row linked into one of the batches is a
+            # cross-tenant association -- both must be seen to be rejected.
+            try:
+                batch_rows = self._connection.execute(
+                    "SELECT batch_id, tenant, record_count, created_at "
+                    "FROM encrypted_batches WHERE tenant=? ORDER BY batch_id ASC",
+                    (tenant,),
+                ).fetchall()
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, batch_id, position, algorithm, "
+                    "encryption_key_id, envelope_nonce, wrapped_key, "
+                    "ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records "
+                    "WHERE tenant=? OR batch_id IN "
+                    "(SELECT batch_id FROM encrypted_batches WHERE tenant=?)",
+                    (tenant, tenant),
+                ).fetchall()
+                event_rows = self._connection.execute(
+                    "SELECT seq, batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events "
+                    "WHERE tenant=? OR batch_id IN "
+                    "(SELECT batch_id FROM encrypted_batches WHERE tenant=?)",
+                    (tenant, tenant),
+                ).fetchall()
+                binding_rows = self._connection.execute(
+                    "SELECT tenant, idempotency_key, batch_id, created_at "
+                    "FROM encrypted_batch_idempotency_keys "
+                    "WHERE tenant=? OR batch_id IN "
+                    "(SELECT batch_id FROM encrypted_batches WHERE tenant=?)",
+                    (tenant, tenant),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            # Index the fetched rows for the per-batch reviews below.
+            batches_by_id = {row["batch_id"]: row for row in batch_rows}
+            records_by_batch: dict[str, list] = {}
+            events_by_batch: dict[str, list] = {}
+            for row in record_rows:
+                records_by_batch.setdefault(row["batch_id"], []).append(row)
+            for event in event_rows:
+                events_by_batch.setdefault(event["batch_id"], []).append(event)
+
+            # Validation phase. First the batch ids themselves, then each batch
+            # as a whole with exactly the same review as the public reads:
+            # count, complete non-repeating 0..count-1 positions on both sides,
+            # tenant/id/position correspondence and stored field shapes.
+            for batch in batch_rows:
+                batch_id = batch["batch_id"]
+                if (
+                    not isinstance(batch_id, str)
+                    or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None
+                ):
+                    raise integrity()
+                self._validate_encrypted_batch(
+                    batch,
+                    records_by_batch.get(batch_id, []),
+                    events_by_batch.get(batch_id, []),
+                )
+
+            # Every in-scope record must link to an existing batch of this
+            # tenant. A link to a missing row is an orphan; a foreign row
+            # linked into one of this tenant's batches fails the same-tenant
+            # correspondence inside the whole-batch review above.
+            for row in record_rows:
+                if (
+                    row["tenant"] != tenant
+                    or not isinstance(row["batch_id"], str)
+                    or row["batch_id"] not in batches_by_id
+                ):
+                    raise integrity()
+
+            # Same link rule for events, plus the sequence's own stored shape:
+            # a signed 64-bit positive integer (gaps are legitimate).
+            for event in event_rows:
+                if (
+                    type(event["seq"]) is not int
+                    or not 1 <= event["seq"] <= MAX_EVENT_SEQ
+                    or event["tenant"] != tenant
+                    or not isinstance(event["record_id"], str)
+                    or not isinstance(event["batch_id"], str)
+                    or event["batch_id"] not in batches_by_id
+                ):
+                    raise integrity()
+
+            # Every binding in scope: this tenant's own keys, and any foreign
+            # row whose link reaches one of this tenant's batches. The latter
+            # is the cross-tenant association the inspection must report.
+            for binding in binding_rows:
+                if binding["tenant"] != tenant:
+                    raise integrity()
+                if (
+                    not isinstance(binding["idempotency_key"], str)
+                    or ENCRYPTED_RECORD_ID.fullmatch(binding["idempotency_key"]) is None
+                ):
+                    raise integrity()
+                bound_batch_id = binding["batch_id"]
+                if (
+                    not isinstance(bound_batch_id, str)
+                    or ENCRYPTED_BATCH_ID.fullmatch(bound_batch_id) is None
+                    or bound_batch_id not in batches_by_id
+                ):
+                    # A malformed link, a dangling binding (missing batch row)
+                    # or one pointing outside this tenant's batches is an
+                    # orphan/cross-tenant relationship failure.
+                    raise integrity()
+                bound_batch = batches_by_id[bound_batch_id]
+                # The binding was committed in the same transaction as the
+                # batch with the same string timestamp; any drift is corruption.
+                bound_at = binding["created_at"]
+                if not isinstance(bound_at, str) or bound_at != bound_batch["created_at"]:
+                    raise integrity()
+
+            # Totals and water come from the same validated serial state. The
+            # record/event/binding totals count this tenant's own rows; a
+            # foreign row linking in would already have failed above.
+            batch_count = len(batch_rows)
+            record_count = len(record_rows)
+            event_count = len(event_rows)
+            binding_count = len(binding_rows)
+            high_water = max((event["seq"] for event in event_rows), default=0)
+            if type(high_water) is not int or not 0 <= high_water <= MAX_EVENT_SEQ:
+                raise integrity()
+
+            return {
+                "status": "ok",
+                "batch_count": batch_count,
+                "record_count": record_count,
+                "event_count": event_count,
+                "binding_count": binding_count,
+                "high_water": high_water,
+            }
+
     def _validate_encrypted_batch(self, batch, record_rows, event_rows) -> None:
         """Cross-check batch, records and append events; raise 422 on any drift."""
         count = batch["record_count"]
