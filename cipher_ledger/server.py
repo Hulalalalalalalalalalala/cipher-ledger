@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .config import Config
-from .ledger import EncryptedEntry, Ledger, LedgerError
+from .ledger import MAX_EVENT_SEQ, EncryptedEntry, Ledger, LedgerError
 
 IDENT_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 BATCH_ID_PATTERN = re.compile(r"batch_[0-9a-f]{32}\Z")
@@ -124,6 +124,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.get_record(path[len("/v1/records/") :])
             elif path == "/v1/encrypted-records/batches":
                 self.list_encrypted_batches(split.query)
+            elif path == "/v1/encrypted-records/events":
+                self.list_encrypted_events(split.query)
             elif path.startswith("/v1/encrypted-records/batches/"):
                 # Any query string is part of the route split but ignored.
                 self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
@@ -510,6 +512,63 @@ class LedgerHandler(BaseHTTPRequestHandler):
             limit = DEFAULT_PAGE_LIMIT
         items, next_cursor = self.server.ledger.list_encrypted_batches(tenant, limit, cursor)
         body = {"items": items}
+        if next_cursor is not None:
+            body["next_cursor"] = next_cursor
+        self.send_json(200, body)
+
+    def list_encrypted_events(self, raw_query: str) -> None:
+        # As on the other sealed-record entry points, identity is an
+        # authorization decision and precedes every query-parameter check.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        limit: int | None = None
+        cursor: str | None = None
+        after_seq_raw: str | None = None
+        for segment in raw_query.split("&") if raw_query else ():
+            name, equals, value = segment.partition("=")
+            if not equals:
+                continue
+            if name == "after_seq":
+                # Pure ASCII digits, 0..2^63-1; leading zeros accepted. An
+                # empty, duplicate or malformed value is a bad request.
+                if (
+                    after_seq_raw is not None
+                    or not value.isascii()
+                    or not value.isdigit()
+                    or int(value) > MAX_EVENT_SEQ
+                ):
+                    self.error(400, "invalid_request")
+                    return
+                after_seq_raw = value
+            elif name == "limit":
+                # Same page-size rule as the batch listing: 1..100.
+                if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= MAX_PAGE_LIMIT:
+                    self.error(400, "invalid_request")
+                    return
+                if limit is not None:
+                    self.error(400, "invalid_request")
+                    return
+                limit = int(value)
+            elif name == "cursor":
+                if cursor is not None:
+                    self.error(400, "invalid_request")
+                    return
+                cursor = value
+            # Any other query parameter is ignored.
+        if cursor is not None and after_seq_raw is not None:
+            # A continuation carries its own frozen start; restarting the
+            # window with after_seq in the same request is ambiguous.
+            self.error(400, "invalid_request")
+            return
+        after_seq = int(after_seq_raw) if after_seq_raw is not None else 0
+        if limit is None:
+            limit = DEFAULT_PAGE_LIMIT
+        items, high_water, next_cursor = self.server.ledger.list_encrypted_events(
+            tenant, after_seq, limit, cursor
+        )
+        body = {"items": items, "high_water": high_water}
         if next_cursor is not None:
             body["next_cursor"] = next_cursor
         self.send_json(200, body)

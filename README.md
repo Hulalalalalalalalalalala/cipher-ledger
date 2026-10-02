@@ -39,6 +39,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `POST /v1/encrypted-records/batch` | 租户头；可选 `Idempotency-Key` 头；调用方已密封的记录集合（见下） | 新键 `201 {"batch_id":"batch_…","count":2,"results":[{"id":"invoice_1","status":"created"}, ...]}`；同键同内容重放 `200`，正文与首次成功一致 |
 | `GET /v1/encrypted-records/batches/{batch_id}` | 租户头；批号为 `batch_` 加 32 个小写十六进制字符；查询参数忽略 | `200 {"batch_id":"…","count":2,"created_at":"…","records":[...]}`（见下） |
 | `GET /v1/encrypted-records/batches` | 租户头；查询参数 `limit`、`cursor`（均可省略） | `200 {"items":[{"batch_id":"…","count":2,"created_at":"…"}, ...],"next_cursor":"..."}`（见下） |
+| `GET /v1/encrypted-records/events` | 租户头；首次查询参数 `after_seq`（可省略，默认 0）、`limit`；续页参数 `cursor` 及可选 `limit` | `200 {"items":[{"seq":…,"batch_id":"…","id":"…","position":…,"created_at":"…"}, ...],"high_water":…,"next_cursor":"..."}`（见下） |
 | `POST /v1/encrypted-records/batch/read` | 租户头；`{"ids":["invoice_1", ...]}`（1 到 100 个不重复 id）；查询参数与未列明字段忽略 | `200 {"count":2,"items":[...]}`（见下，按输入顺序跨批次返回） |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
@@ -198,6 +199,41 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 4. 待返回页中批号格式非法、`count` 非整数或超出 1 到 100、`created_at` 非字符串：`422 integrity_error`。后续页中的损坏摘要只在该页被请求时才报错，不影响其前各页。
 
 该查询与本进程的并发密封提交等价于一个完整串行时刻，只能看到提交前或完整提交后的清单，不观察部分提交。
+
+### 增量查询租户追加事件 `GET /v1/encrypted-records/events`
+
+该入口只读地按追加账本顺序增量返回当前租户的追加事件：每条成功提交的密封记录对应一个事件（批次内多条记录对应连续的多个事件，按位置排列）。请求头必须带合法的 `X-Tenant-ID`。成功返回 `200`：
+
+```json
+{
+  "items": [
+    {
+      "seq": 7,
+      "batch_id": "batch_0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "id": "invoice_1",
+      "position": 0,
+      "created_at": "2026-10-02T08:30:00+00:00"
+    }
+  ],
+  "high_water": 7
+}
+```
+
+- 首次查询接受 `after_seq` 与 `limit`。`after_seq` 省略时为 `0`；显式给出时必须纯由 ASCII 数字组成、取值 `0` 到 `9223372036854775807`（允许前导零，如 `007`），为空、含非数字、为负、小数、十六进制或超出上界均为 `400 invalid_request`。`limit` 沿用批次清单的分页大小规则：省略时每页 50，显式给出时为 1 到 100 的纯 ASCII 数字（允许前导零）。
+- 续页只接受 `cursor` 及可选 `limit`（允许与前页不同的页大小）；`cursor` 与 `after_seq` 同时出现为 `400 invalid_request`。其他查询参数一律忽略。
+- `items` 按 `seq` 升序返回，每页至多 `limit` 项；每项恰含 `seq`、`batch_id`、`id`、`position`、`created_at` 五个字段，取值来自追加事件及其所属批次（`created_at` 为该批次提交时原样存库的字符串，同一批次的多个事件取值相同），不返回密文、信封、算法或元数据。空结果为 `items: []`。
+- 其他租户的事件与服务端加密普通记录均不可见。`seq` 是全局单调账本，本租户看到的序号允许有间隔；不存在任何密封批次的租户返回 `200 {"items":[],"high_water":0}`。
+
+首次查询在某个**完整串行时刻**固定本次遍历范围：`high_water = max(after_seq, 当时本租户最大事件序号)`，空租户的最大序号视为 `0`；只遍历严格大于起点且不超过水位的事件。水位随每次响应（含空页与各续页）原样返回。有后续页时响应才含 `next_cursor`，末页省略该字段。游标内部冻结本次的起点、水位与偏移，因此续页水位保持不变，遍历期间新提交的事件留到下次查询；调用方读完后应以返回的 `high_water` 作为新的 `after_seq` 获取后续事件。游标不透明、不自动过期，绑定租户与本入口（与记录清单、批次清单的游标互不通用），正常重启后仍有效，密钥轮换不影响结果；同一游标配合相同 `limit` 重复查询结果一致。失败写入与幂等重放不增加事件。该查询不新增或修改任何批次、记录、事件或幂等绑定。
+
+错误响应只含 `{"error":"错误码"}`，不返回部分页面，判定顺序固定：
+
+1. 缺少或非法的 `X-Tenant-ID`：`403 TENANT_RECORD_FORBIDDEN`，优先于一切查询参数判定。
+2. 租户合法后：已知参数空值、格式非法、越界或重复，`cursor` 与 `after_seq` 并存，以及损坏、签名不符、属于其他租户或来自其他入口的游标，均为 `400 invalid_request`；未知参数忽略。
+3. 参数合法后先读取当前页事件及其涉及批次的批次行、全部记录与全部事件；此阶段 SQLite 失败返回 `503 storage_error`。
+4. 取得数据后沿用整批读取的完整一致性与存储形状复核：事件关联批次缺失、事件上的批号非法（非 `batch_` 加 32 个小写十六进制字符）或批次归属其他租户，以及涉及批次的任一记录、事件不合规——包括本页未列出的同批其他记录——整次返回 `422 integrity_error`；未涉及的批次即使损坏也不影响本页。
+
+该查询与本进程的并发密封提交等价于一个完整串行时刻：要么看到某次提交前要么看到其完整提交后的全部事件，不观察部分提交；密封记录不参与服务端密钥轮换。
 
 ### 按记录 id 跨批次取回密封记录 `POST /v1/encrypted-records/batch/read`
 

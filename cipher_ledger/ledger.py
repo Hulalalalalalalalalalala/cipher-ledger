@@ -93,6 +93,11 @@ ENCRYPTED_BATCH_ID = re.compile(r"batch_[0-9a-f]{32}\Z")
 # from replaying on the other even though they share one HMAC key.
 RECORD_LIST_CURSOR_NAMESPACE = "records"
 BATCH_LIST_CURSOR_NAMESPACE = "encrypted-batches"
+# The append-event feed has its own namespace: its cursor carries a frozen
+# (start, high water, offset) window rather than a snapshot id, and must never
+# replay on either listing endpoint.
+EVENT_FEED_CURSOR_NAMESPACE = "encrypted-record-events"
+MAX_EVENT_SEQ = 9223372036854775807
 
 
 def _json_semantic_equal(left: object, right: object) -> bool:
@@ -848,6 +853,262 @@ class Ledger:
                 item["created_at"] = batch["created_at"]
                 items.append(item)
             return items
+
+    # -- append-event feed --------------------------------------------------
+
+    def list_encrypted_events(
+        self, tenant: str, after_seq: int, limit: int, cursor: str | None
+    ) -> tuple[list[dict], int, str | None]:
+        """List a tenant's append events from one frozen serial window.
+
+        A cursorless request fixes one complete serial instant: the window is
+        ``(after_seq, high_water]`` where ``high_water`` is ``max(after_seq,
+        this tenant's largest event seq)`` -- an empty tenant's maximum is
+        treated as 0. Only events strictly above the start and at most the high
+        water are walked, in ascending ``seq``; gaps (other tenants interleave
+        the global seq stream) are simply absent. The window is frozen into the
+        cursor chain, so later pages keep the same high water and batches
+        committed afterwards stay invisible until the caller starts a fresh
+        cursorless query, conventionally adopting the returned high water as
+        its next ``after_seq``.
+
+        Before a page is shaped, every batch *involved by that page* is loaded
+        whole (batch row, every record, every event) and passes the same
+        cross-table/stored-shape review as the whole-batch read; a malformed or
+        dangling batch link, a foreign-owned batch or any drift in a batch --
+        including records the page does not list -- is 422. An unrelated batch
+        is never loaded. Items expose no ciphertext or envelope.
+
+        Read-only: it adds no batches, records, events or idempotency bindings.
+        Returns (items, high_water, next_cursor_or_None).
+        """
+        with self._lock:
+            if cursor is None:
+                try:
+                    row = self._connection.execute(
+                        "SELECT MAX(seq) FROM encrypted_record_events WHERE tenant=?",
+                        (tenant,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    raise storage() from None
+                # MAX is NULL for a tenant with no events: its maximum is 0.
+                max_seq = row[0] if row is not None else None
+                if type(max_seq) is not int:
+                    max_seq = 0
+                start = after_seq
+                high_water = max(after_seq, max_seq)
+                offset = 0
+            else:
+                start, high_water, offset = self._parse_event_cursor(tenant, cursor)
+
+            try:
+                total = self._connection.execute(
+                    "SELECT COUNT(*) FROM encrypted_record_events "
+                    "WHERE tenant=? AND seq>? AND seq<=?",
+                    (tenant, start, high_water),
+                ).fetchone()[0]
+                rows = self._connection.execute(
+                    "SELECT seq, batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events "
+                    "WHERE tenant=? AND seq>? AND seq<=? "
+                    "ORDER BY seq ASC LIMIT ? OFFSET ?",
+                    (tenant, start, high_water, limit, offset),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            if type(total) is not int or not 0 <= offset <= total:
+                # A minted chain always points inside its frozen window; an
+                # offset past the end can only be a damaged or foreign cursor
+                # or a window tampered with after minting.
+                raise integrity() if cursor is not None else invalid_request()
+            expected = min(limit, total - offset)
+            if len(rows) != expected:
+                # The frozen window shrank or its rows were edited offline.
+                raise integrity()
+            # The append stream is keyed by an integer primary key; reject any
+            # non-integer seq/position that type coercion could surface.
+            for row in rows:
+                if type(row["seq"]) is not int or type(row["position"]) is not int:
+                    raise integrity()
+
+            batches_by_id, records_by_batch = self._load_and_review_event_batches(
+                tenant, rows
+            )
+            # The whole-batch review guarantees one record per position 0..
+            # count-1 and binds each event's record id to that position; index
+            # that binding so shaping the page cannot project a mismatched row.
+            record_id_at_position = {
+                (record["batch_id"], record["position"]): record["id"]
+                for batch_records in records_by_batch.values()
+                for record in batch_records
+            }
+
+            items: list[dict] = []
+            for row in rows:
+                # The window query is tenant scoped, but the stored row is
+                # re-checked before it is shaped so offline type drift can
+                # never be projected.
+                if (
+                    row["tenant"] != tenant
+                    or not isinstance(row["record_id"], str)
+                    or ENCRYPTED_RECORD_ID.fullmatch(row["record_id"]) is None
+                ):
+                    raise integrity()
+                expected_record_id = record_id_at_position.get(
+                    (row["batch_id"], row["position"])
+                )
+                if expected_record_id != row["record_id"]:
+                    raise integrity()
+                batch = batches_by_id[row["batch_id"]]
+                items.append(
+                    {
+                        "seq": row["seq"],
+                        "batch_id": batch["batch_id"],
+                        "id": row["record_id"],
+                        "position": row["position"],
+                        "created_at": batch["created_at"],
+                    }
+                )
+
+            end = offset + limit
+            next_cursor = (
+                self._issue_event_cursor(start, high_water, end, tenant)
+                if end < total
+                else None
+            )
+            return items, high_water, next_cursor
+
+    def _load_and_review_event_batches(self, tenant: str, event_rows) -> tuple[dict, dict]:
+        """Load and whole-batch-review every batch referenced by a page.
+
+        Mirrors the staging of the by-ids sealed read: all referenced batch
+        rows, all of their records and all of their append events are fetched
+        before any review, and each involved batch is checked as a whole -- so
+        an unlisted sibling record of the same batch still fails the page,
+        while a damaged batch that the page never touches cannot affect it.
+        Returns (batches_by_id, records_by_batch).
+        """
+        batch_ids: list[str] = []
+        seen: set[str] = set()
+        for event in event_rows:
+            # Distinct referenced batches; the stored link's shape is part of
+            # the post-fetch review below so a stage-2 SQLite failure still
+            # surfaces as 503 even when a link is also malformed.
+            batch_id = event["batch_id"]
+            if batch_id not in seen:
+                seen.add(batch_id)
+                batch_ids.append(batch_id)
+
+        placeholders = ",".join("?" * len(batch_ids))
+        batches_by_id: dict[str, object] = {}
+        records_by_batch: dict[str, list] = {}
+        events_by_batch: dict[str, list] = {}
+        # An empty page (e.g. an empty tenant or after_seq at the water) has no
+        # batch to review; skip the IN-queries rather than emit invalid SQL.
+        if batch_ids:
+            try:
+                batch_rows = self._connection.execute(
+                    "SELECT batch_id, tenant, record_count, created_at "
+                    "FROM encrypted_batches WHERE batch_id IN (%s)" % placeholders,
+                    batch_ids,
+                ).fetchall()
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, batch_id, position, algorithm, encryption_key_id, "
+                    "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records WHERE batch_id IN (%s) ORDER BY position ASC"
+                    % placeholders,
+                    batch_ids,
+                ).fetchall()
+                full_event_rows = self._connection.execute(
+                    "SELECT seq, batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events WHERE batch_id IN (%s) ORDER BY seq ASC"
+                    % placeholders,
+                    batch_ids,
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            batches_by_id = {row["batch_id"]: row for row in batch_rows}
+            for row in record_rows:
+                records_by_batch.setdefault(row["batch_id"], []).append(row)
+            for event in full_event_rows:
+                events_by_batch.setdefault(event["batch_id"], []).append(event)
+
+        for batch_id in batch_ids:
+            # The associated batch id comes from a stored event row, not a
+            # path-validated URL, so its shape is itself part of the review
+            # (a non-string or malformed link is integrity drift).
+            if not isinstance(batch_id, str) or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None:
+                raise integrity()
+            batch = batches_by_id.get(batch_id)
+            # A dangling event (the batch row is missing) or an event repointed
+            # at another tenant's batch is a relationship failure.
+            if batch is None or batch["tenant"] != tenant:
+                raise integrity()
+            self._validate_encrypted_batch(
+                batch,
+                records_by_batch.get(batch_id, []),
+                events_by_batch.get(batch_id, []),
+            )
+        return batches_by_id, records_by_batch
+
+    def _issue_event_cursor(
+        self, start: int, high_water: int, offset: int, tenant: str
+    ) -> str:
+        """Mint a signed cursor carrying the frozen feed window and offset."""
+        body = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "ns": EVENT_FEED_CURSOR_NAMESPACE,
+                    "s": start,
+                    "w": high_water,
+                    "o": offset,
+                    "n": tenant,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        encoded_body = body.rstrip(b"=")
+        tag = hmac.new(self._cursor_secret, encoded_body, hashlib.sha256).digest()
+        encoded_tag = base64.urlsafe_b64encode(tag).rstrip(b"=")
+        return (encoded_body + b"." + encoded_tag).decode("ascii")
+
+    def _parse_event_cursor(self, tenant: str, cursor: str) -> tuple[int, int, int]:
+        """Verify and decode a feed cursor; reject every other cursor kind."""
+        try:
+            body, encoded_tag = cursor.encode("ascii").split(b".", 1)
+            tag = base64.urlsafe_b64decode(encoded_tag + b"=" * (-len(encoded_tag) % 4))
+            expected = hmac.new(self._cursor_secret, body, hashlib.sha256).digest()
+            if len(tag) != 32 or not hmac.compare_digest(tag, expected):
+                raise invalid_request()
+            decoded_body = base64.urlsafe_b64decode(body + b"=" * (-len(body) % 4))
+            payload = json.loads(decoded_body)
+            start = payload["s"]
+            high_water = payload["w"]
+            offset = payload["o"]
+            cursor_tenant = payload["n"]
+            namespace = payload["ns"]
+        except (
+            UnicodeEncodeError,
+            ValueError,
+            KeyError,
+            TypeError,
+            binascii.Error,
+        ):
+            raise invalid_request() from None
+        if (
+            not isinstance(payload, dict)
+            or namespace != EVENT_FEED_CURSOR_NAMESPACE
+            or cursor_tenant != tenant
+            or type(start) is not int
+            or type(high_water) is not int
+            or type(offset) is not int
+            or not 0 <= start <= high_water <= MAX_EVENT_SEQ
+            or offset < 0
+        ):
+            raise invalid_request()
+        return start, high_water, offset
 
     def _validate_encrypted_batch(self, batch, record_rows, event_rows) -> None:
         """Cross-check batch, records and append events; raise 422 on any drift."""
