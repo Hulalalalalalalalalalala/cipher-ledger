@@ -127,6 +127,11 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.list_encrypted_batches(split.query)
             elif path == "/v1/encrypted-records/events":
                 self.list_encrypted_events(split.query)
+            elif path.startswith("/v1/encrypted-records/receipts/"):
+                # Query string is ignored, exactly as on the by-batch read.
+                self.get_encrypted_receipt(
+                    path[len("/v1/encrypted-records/receipts/") :]
+                )
             elif path.startswith("/v1/encrypted-records/batches/"):
                 # Any query string is part of the route split but ignored.
                 self.get_encrypted_batch(path[len("/v1/encrypted-records/batches/") :])
@@ -601,6 +606,25 @@ class LedgerHandler(BaseHTTPRequestHandler):
         # Query parameters are ignored by design; urlsplit already stripped them.
         result = self.server.ledger.read_encrypted_batch(tenant, batch_id)
         self.send_json(200, result)
+
+    def get_encrypted_receipt(self, idempotency_key: str) -> None:
+        # Tenant resolution is an authorization decision, as on the sealed
+        # ingress: a missing/invalid header fails before the key is inspected.
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(403, "TENANT_RECORD_FORBIDDEN")
+            return
+        # The key follows the Idempotency-Key header's exact grammar and case
+        # rules: an empty or malformed path segment is a plain bad request.
+        # The segment is matched verbatim (urlsplit leaves it undecoded), so a
+        # percent-encoded or otherwise non-ident value fails rather than being
+        # silently normalized.
+        if not is_ident(idempotency_key):
+            self.error(400, "invalid_request")
+            return
+        # Query parameters are ignored by design; urlsplit already stripped them.
+        receipt = self.server.ledger.read_idempotency_receipt(tenant, idempotency_key)
+        self.send_json(200, receipt)
 
     def rotate_keys(self) -> None:
         payload = self.read_json_object()

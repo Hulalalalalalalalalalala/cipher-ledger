@@ -614,6 +614,112 @@ class Ledger:
 
         return EncryptedBatchReplay(batch_id, [row["id"] for row in record_rows])
 
+    def read_idempotency_receipt(self, tenant: str, idempotency_key: str) -> dict:
+        """Return the write receipt previously bound to one idempotency key.
+
+        Allows a client to confirm a sealed-batch write by its key alone,
+        without resubmitting ciphertext. The caller has already settled the
+        403/400 precedence (tenant, then key shape).
+
+        Resolution is deliberately staged, mirroring the cross-batch sealed
+        read:
+
+        1. Read this tenant's binding. A SQLite failure is 503; no row for
+           ``(tenant, key)`` is 404 -- another tenant binding the same key
+           name is invisible and stays a 404. Keyless legacy batches never
+           have a binding row.
+        2. The bound batch id itself must be a legal ``batch_`` id; then the
+           batch row is read (503 on SQLite failure). A missing or
+           foreign-tenant batch, a binding ``created_at`` that is not a string
+           or differs from the batch row's verbatim value are 422.
+        3. Only once every read has succeeded are the batch, every record and
+           every append event reviewed with the same whole-batch validation as
+           the by-batch read (count, positions, tenant/id correspondence,
+           stored field shapes); any drift is 422. Corruption in an unrelated
+           batch is never loaded.
+
+        The receipt is {"batch_id", "count", "results", "created_at"}: the
+        first three match the key's first successful write response exactly
+        (results in stored submission order, each ``{"id", "status":
+        "created"}``) and ``created_at`` is the batch's stored string. Read-only
+        -- no binding, batch, record or event is added, changed or repaired,
+        and envelopes are never opened. Runs under the process-wide lock, so a
+        same-key commit in flight is observed only as unbound (404) or as the
+        complete committed receipt, never a partial one; a rolled-back failed
+        commit leaves the key unbound and an idempotent replay changes
+        nothing.
+        """
+        with self._lock:
+            try:
+                binding = self._connection.execute(
+                    "SELECT tenant, idempotency_key, batch_id, created_at "
+                    "FROM encrypted_batch_idempotency_keys "
+                    "WHERE tenant=? AND idempotency_key=?",
+                    (tenant, idempotency_key),
+                ).fetchone()
+            except sqlite3.Error:
+                raise storage() from None
+            # Scoped by tenant in the WHERE clause: a same-named key bound by
+            # another tenant is indistinguishable from an unbound key.
+            if binding is None:
+                raise not_found()
+
+            batch_id = binding["batch_id"]
+            # The associated id comes from stored rows rather than a
+            # path-validated URL, so its type/shape are themselves part of the
+            # review (a non-string or malformed link is integrity drift).
+            if not isinstance(batch_id, str) or ENCRYPTED_BATCH_ID.fullmatch(batch_id) is None:
+                raise integrity()
+
+            try:
+                batch = self._connection.execute(
+                    "SELECT batch_id, tenant, record_count, created_at "
+                    "FROM encrypted_batches WHERE batch_id=?",
+                    (batch_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                raise storage() from None
+            if batch is None or batch["tenant"] != tenant:
+                # Missing batch or a binding repointed at another tenant's
+                # batch is an integrity failure, not a missing binding.
+                raise integrity()
+
+            binding_created_at = binding["created_at"]
+            # The binding was written in the same transaction as the batch with
+            # the identical created_at string; a non-string or drifted value is
+            # corruption, reported only after the batch read itself succeeded.
+            if not isinstance(binding_created_at, str) or binding_created_at != batch["created_at"]:
+                raise integrity()
+
+            try:
+                record_rows = self._connection.execute(
+                    "SELECT tenant, id, batch_id, position, algorithm, encryption_key_id, "
+                    "envelope_nonce, wrapped_key, ciphertext, ciphertext_nonce, tag, metadata "
+                    "FROM encrypted_records WHERE batch_id=? ORDER BY position ASC",
+                    (batch_id,),
+                ).fetchall()
+                event_rows = self._connection.execute(
+                    "SELECT batch_id, tenant, record_id, position "
+                    "FROM encrypted_record_events WHERE batch_id=? ORDER BY seq ASC",
+                    (batch_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            # All required reads succeeded; only now may stored-state drift be
+            # judged: the exact whole-batch review used by the batch read and
+            # the idempotent replay path.
+            self._validate_encrypted_batch(batch, record_rows, event_rows)
+
+            return {
+                "batch_id": batch["batch_id"],
+                "count": len(record_rows),
+                "results": [
+                    {"id": row["id"], "status": "created"} for row in record_rows
+                ],
+                "created_at": batch["created_at"],
+            }
+
     def _entries_match_bound_batch(
         self, entries: list[EncryptedEntry], record_rows
     ) -> bool:
